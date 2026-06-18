@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.ty/
+
+# Environments
+.venv/
+.env
+
+# Research outputs
+outputs/
+reports/
+wandb/
+*.ckpt
+*.pt
+*.pth
+
+# Generated data artifacts
+data/**/train.npy
+data/**/val.npy
+data/**/tokenizer.json
+data/**/meta.json
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

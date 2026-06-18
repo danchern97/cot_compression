@@ -1,0 +1,7 @@
+family: char_gpt
+block_size: ${data.block_size}
+n_layer: 2
+n_head: 2
+n_embd: 64
+dropout: 0.1
+bias: true

@@ -1,0 +1,9 @@
+name: tiny_shakespeare_char
+source_path: ${paths.data_dir}/tiny_shakespeare_char/input.txt
+prepared_dir: ${paths.data_dir}/tiny_shakespeare_char
+download_url: https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+allow_download: false
+train_split: 0.9
+block_size: 128
+batch_size: 32
+eval_batch_size: ${data.batch_size}

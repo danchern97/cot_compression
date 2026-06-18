@@ -1,0 +1,9 @@
+enabled: true
+mode: offline
+project: research-project-template
+entity: null
+group: null
+name: null
+tags:
+  - tiny-gpt
+log_file_name: train.log

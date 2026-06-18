@@ -1,0 +1,18 @@
+defaults:
+  - paths: default
+  - data: tiny_shakespeare_char
+  - method: char_gpt/tiny
+  - training: default
+  - logging: wandb
+  - _self_
+
+mode: evaluate
+checkpoint:
+  path: null
+eval_iters: 50
+
+hydra:
+  run:
+    dir: ${paths.output_dir}/runs/evaluate/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

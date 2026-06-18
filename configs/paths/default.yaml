@@ -1,0 +1,5 @@
+project_root: ${hydra:runtime.cwd}
+output_dir: ${paths.project_root}/outputs
+data_dir: ${paths.project_root}/data
+reports_dir: ${paths.project_root}/reports
+run_dir: null

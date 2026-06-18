@@ -1,0 +1,6 @@
+name: adamw
+lr: 0.001
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+eps: 1e-8
