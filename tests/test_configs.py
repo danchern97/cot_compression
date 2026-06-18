@@ -8,10 +8,11 @@ from hydra import compose, initialize_config_dir
 def test_hydra_configs_compose() -> None:
     config_dir = str(Path(__file__).resolve().parents[1] / "configs")
     with initialize_config_dir(version_base=None, config_dir=config_dir):
-        train_cfg = compose(config_name="train", overrides=["logging.enabled=false"])
-        eval_cfg = compose(config_name="evaluate")
-        generate_cfg = compose(config_name="generate")
+        sft_cfg = compose(
+            config_name="run",
+            overrides=["logging.enabled=false"],
+        )
 
-    assert train_cfg.data.name == "tiny_shakespeare_char"
-    assert eval_cfg.mode == "evaluate"
-    assert generate_cfg.prompt == "First Citizen:"
+    assert sft_cfg.mode == "sft_train"
+    assert sft_cfg.method.model_name == "Qwen/Qwen3-4B"
+    assert sft_cfg.training.torch_dtype == "bfloat16"

@@ -1,15 +1,18 @@
 [project]
-name = "research-project-template"
+name = "cot-compression"
 version = "0.1.0"
-description = "A Hydra and PyTorch research project template for student projects."
+description = "Plain PyTorch experiments for chain-of-thought compression."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "accelerate>=0.30",
+    "datasets>=2.20",
     "hydra-core>=1.3.2",
     "numpy>=1.26",
     "omegaconf>=2.3",
     "torch>=2.3",
     "tqdm>=4.66",
+    "transformers>=4.51.0",
     "wandb>=0.17",
 ]
 
@@ -25,7 +28,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/research_project_template"]
+packages = ["src/cot_compression"]
 
 [tool.ruff]
 line-length = 88

@@ -1,0 +1,32 @@
+# @package _global_
+
+defaults:
+  - /paths: default
+  - /data: dolci_think_sft_600k
+  - /method: qwen3/4b
+  - /training: sft_full_bf16
+  - /optim: adamw
+  - /logging: wandb
+  - _self_
+
+mode: sft_train
+
+optim:
+  lr: 0.00001
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1e-8
+
+logging:
+  project: qwen3-dolci-sft
+  tags:
+    - qwen3-4b
+    - dolci
+    - sft
+
+hydra:
+  run:
+    dir: ${paths.output_dir}/runs/sft/${data.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

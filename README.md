@@ -1,26 +1,23 @@
-# Research Project Template
+# CoT Compression
 
-A small, pure-PyTorch research template for student projects. It uses Hydra for
-configuration, uv for dependency management, ruff for formatting/linting, and ty
-for type checking.
+A small, pure-PyTorch research project for chain-of-thought compression
+experiments. It uses Hydra for configuration, uv for dependency management,
+ruff for formatting/linting, and ty for type checking.
 
-The runnable example is a tiny character-level GPT language model inspired by
-nanoGPT. The project layout follows the same separation you should keep in your
-own work:
+The project includes a plain PyTorch SFT path for Qwen3-4B on Dolci reasoning
+traces. The layout follows this separation:
 
-- `src/research_project_template/data`: loading and preprocessing data.
-- `src/research_project_template/methods`: models, methods, and generation.
-- `src/research_project_template/training`: training, evaluation, logging, and
-  checkpointing.
+- `src/cot_compression/data`: loading and preprocessing data.
+- `src/cot_compression/training`: training, logging, and checkpointing.
 - `scripts`: thin Hydra entrypoints that call the package code.
 - `configs`: hierarchical YAML configuration.
 - `tests`: unit and smoke tests.
 
 ## Code Style and Philosophy
 
-This template is meant to be read, copied, and changed. Prefer short files with
-one clear job over large modules that hide many ideas at once. A student should
-be able to open a file, read it top to bottom, and understand what part of the
+This project is meant to be read and changed. Prefer short files with one clear
+job over large modules that hide many ideas at once. A researcher should be able
+to open a file, read it top to bottom, and understand what part of the
 experiment it owns.
 
 Keep research logic explicit. The training loop is intentionally written as a
@@ -33,7 +30,7 @@ YAML files should describe which dataset, method, optimizer, paths, and training
 settings are used. Python modules should still contain the actual behavior.
 
 Keep scripts thin. Files in `scripts/` should compose a config and call package
-code. Put reusable implementation in `src/research_project_template/`, where it
+code. Put reusable implementation in `src/cot_compression/`, where it
 can be tested and imported by other scripts.
 
 Write tests for behavior, not implementation trivia. Good tests check that data
@@ -49,29 +46,31 @@ uv sync
 
 ## Common Commands
 
-Prepare the example corpus:
+Fine-tune Qwen3-4B on the Dolci reasoning SFT subset with a plain PyTorch loop:
 
 ```bash
-uv run python scripts/prepare_data.py
+uv run python scripts/run.py workflow=sft_train
 ```
 
-Train a tiny character GPT:
+For convenience, the default workflow and `sft` alias do the same thing:
 
 ```bash
-uv run python scripts/train.py
+uv run python scripts/run.py
+uv run python scripts/run.py sft
 ```
 
-Evaluate a checkpoint:
+For a shorter real-model smoke run, override the dataset and training sizes:
 
 ```bash
-uv run python scripts/evaluate.py checkpoint.path=/path/to/checkpoint.pt
+uv run python scripts/run.py sft data.train_size=1000 data.eval_size=100 training.max_steps=10 logging.enabled=false
 ```
 
-Generate text from a checkpoint:
-
-```bash
-uv run python scripts/generate.py checkpoint.path=/path/to/checkpoint.pt
-```
+The SFT path loads `Qwen/Qwen3-4B` in full bf16 by default, so real runs need a
+GPU with enough memory for full-parameter training. It materializes a
+deterministic 600k train plus 2k eval subset from
+`allenai/Dolci-Think-SFT-7B` under `data/dolci_think_sft_600k`, preserves the
+dataset's existing `<think>...</think>` assistant traces, and trains only on
+assistant-message tokens.
 
 Run checks:
 
@@ -87,7 +86,7 @@ uv run ty check
 Hydra configs live under `configs/`. Override values from the command line:
 
 ```bash
-uv run python scripts/train.py training.max_steps=50 data.block_size=64
+uv run python scripts/run.py training.max_steps=50 data.train_size=1000
 ```
 
 Outputs are written under `outputs/runs/...` by default. Each run contains the

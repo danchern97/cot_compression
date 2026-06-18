@@ -29,7 +29,7 @@ class RunLogger:
             )
 
     def _build_text_logger(self, log_path: Path) -> logging.Logger:
-        logger = logging.getLogger("research_project_template")
+        logger = logging.getLogger("cot_compression")
         logger.handlers.clear()
         logger.setLevel(logging.INFO)
         logger.propagate = False
