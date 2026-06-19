@@ -1,0 +1,15 @@
+seed: 1337
+device: auto
+torch_dtype: bfloat16
+max_length: 4096
+max_examples: null
+metric: answer_nll
+normalize_by_length: true
+save_token_losses: true
+methods:
+  enabled:
+    - base
+    - random
+  random:
+    abstract_vocab_size: 1024
+    abstract_length: 128

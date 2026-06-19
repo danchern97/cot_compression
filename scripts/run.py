@@ -7,15 +7,17 @@ from pathlib import Path
 import hydra
 from omegaconf import DictConfig
 
-from cot_compression.training import train_sft
+from cot_compression.training import evaluate_methods, train_sft
 
 Workflow = Callable[[DictConfig], object]
 
 WORKFLOWS: dict[str, Workflow] = {
+    "evaluate_methods": evaluate_methods,
     "sft_train": train_sft,
 }
 
 ALIASES = {
+    "eval": "evaluate_methods",
     "sft": "sft_train",
 }
 

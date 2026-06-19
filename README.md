@@ -72,6 +72,27 @@ deterministic 600k train plus 2k eval subset from
 dataset's existing `<think>...</think>` assistant traces, and trains only on
 assistant-message tokens.
 
+Evaluate pretrained Qwen methods on answer-only Dolci dev loss:
+
+```bash
+uv run python scripts/run.py eval
+```
+
+The default evaluation model is `Qwen/Qwen3-0.6B`. The `base` method leaves the
+full trace unchanged, while `random` replaces the contents inside
+`<think>...</think>` with deterministic abstract tokens before scoring only the
+final answer tokens.
+Artifacts are written under the run directory as `summary.json`, `samples.jsonl`,
+and optionally `tokens.jsonl`.
+
+Useful overrides:
+
+```bash
+uv run python scripts/run.py eval method.model_name=Qwen/Qwen3-4B
+uv run python scripts/run.py eval evaluation.max_examples=100
+uv run python scripts/run.py eval evaluation.methods.random.abstract_vocab_size=2048 evaluation.methods.random.abstract_length=128
+```
+
 Run checks:
 
 ```bash

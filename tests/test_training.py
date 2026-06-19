@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from cot_compression.data.dolci import DolciSFTData
+from cot_compression.training.evaluate import evaluate_methods
 from cot_compression.training.sft import train_sft
 
 
@@ -20,10 +22,25 @@ class FakeSFTTokenizer:
         self.pad_token_id = 0
         self.pad_token = "<pad>"
         self.truncation_side = "right"
+        self._token_to_id: dict[str, int] = {}
+        self._vocab_size = 128
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         return cls()
+
+    def __len__(self) -> int:
+        return self._vocab_size
+
+    def add_tokens(self, tokens: list[str]) -> int:
+        added = 0
+        for token in tokens:
+            if token in self._token_to_id:
+                continue
+            self._token_to_id[token] = self._vocab_size
+            self._vocab_size += 1
+            added += 1
+        return added
 
     def apply_chat_template(
         self,
@@ -31,6 +48,7 @@ class FakeSFTTokenizer:
         tokenize: bool,
         add_generation_prompt: bool,
     ) -> str:
+        del tokenize, add_generation_prompt
         return "".join(
             f"<|{message['role']}|>\n{message['content']}\n" for message in messages
         )
@@ -43,14 +61,30 @@ class FakeSFTTokenizer:
         truncation: bool,
         return_offsets_mapping: bool,
     ):
+        del add_special_tokens, truncation, return_offsets_mapping
         start = max(0, len(text) - max_length) if self.truncation_side == "left" else 0
         text = text[start : start + max_length]
+        input_ids = []
+        offsets = []
+        index = 0
+        tokens_by_length = sorted(self._token_to_id, key=len, reverse=True)
+        while index < len(text):
+            matched = next(
+                (token for token in tokens_by_length if text.startswith(token, index)),
+                None,
+            )
+            if matched is not None:
+                input_ids.append(self._token_to_id[matched])
+                offsets.append((index + start, index + start + len(matched)))
+                index += len(matched)
+                continue
+            input_ids.append((ord(text[index]) % 64) + 1)
+            offsets.append((index + start, index + start + 1))
+            index += 1
         return {
-            "input_ids": [(ord(char) % 64) + 1 for char in text],
-            "attention_mask": [1 for _ in text],
-            "offset_mapping": [
-                (index + start, index + start + 1) for index, _ in enumerate(text)
-            ],
+            "input_ids": input_ids,
+            "attention_mask": [1 for _ in input_ids],
+            "offset_mapping": offsets,
         }
 
     def save_pretrained(self, path) -> None:
@@ -61,7 +95,7 @@ class TinySFTModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.config = SimpleNamespace(use_cache=True)
-        self.embedding = nn.Embedding(128, 8)
+        self.embedding = nn.Embedding(512, 8)
         self.lm_head = nn.Linear(8, 128)
 
     @classmethod
@@ -71,17 +105,23 @@ class TinySFTModel(nn.Module):
     def gradient_checkpointing_enable(self) -> None:
         return None
 
+    def resize_token_embeddings(self, size: int, mean_resizing: bool = False) -> None:
+        del mean_resizing
+        self.lm_head = nn.Linear(8, size)
+
     def save_pretrained(self, path) -> None:
         torch.save(self.state_dict(), Path(path) / "model.pt")
 
-    def forward(self, input_ids, attention_mask, labels):
+    def forward(self, input_ids, attention_mask, labels=None):
         del attention_mask
         logits = self.lm_head(self.embedding(input_ids))
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
-            ignore_index=-100,
-        )
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100,
+            )
         return SimpleNamespace(loss=loss, logits=logits)
 
 
@@ -167,3 +207,102 @@ def test_plain_sft_training_step(monkeypatch, tmp_path) -> None:
     assert checkpoint.exists()
     assert (checkpoint / "training_state.pt").exists()
     assert (checkpoint / "model.pt").exists()
+
+
+def test_answer_loss_evaluation_smoke(monkeypatch, tmp_path) -> None:
+    examples = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "<think>Trace</think> Answer"},
+                ],
+                "dataset_source": "valid",
+                "id": "ok",
+            },
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Answer only"},
+                ],
+                "dataset_source": "invalid",
+                "id": "skip",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        "cot_compression.training.evaluate.AutoTokenizer",
+        FakeSFTTokenizer,
+    )
+    monkeypatch.setattr(
+        "cot_compression.training.evaluate.AutoModelForCausalLM",
+        TinySFTModel,
+    )
+    monkeypatch.setattr(
+        "cot_compression.training.evaluate.load_dolci_sft_data",
+        lambda cfg: DolciSFTData(train=examples, eval=examples),
+    )
+
+    cfg = OmegaConf.create(
+        {
+            "paths": {"run_dir": str(tmp_path / "eval")},
+            "data": {"prepared_dir": str(tmp_path / "data")},
+            "method": {
+                "model_name": "tiny",
+                "trust_remote_code": False,
+                "use_fast_tokenizer": True,
+            },
+            "evaluation": {
+                "seed": 7,
+                "device": "cpu",
+                "torch_dtype": "float32",
+                "max_length": 128,
+                "max_examples": None,
+                "metric": "answer_nll",
+                "normalize_by_length": True,
+                "save_token_losses": True,
+                "methods": {
+                    "enabled": ["base", "random"],
+                    "random": {
+                        "abstract_vocab_size": 4,
+                        "abstract_length": 3,
+                    },
+                },
+            },
+            "logging": {
+                "enabled": False,
+                "mode": "offline",
+                "project": "tests",
+                "entity": None,
+                "group": None,
+                "name": None,
+                "tags": [],
+                "log_file_name": "eval.log",
+            },
+        }
+    )
+
+    summary_path = evaluate_methods(cfg)
+    samples_path = summary_path.with_name("samples.jsonl")
+    tokens_path = summary_path.with_name("tokens.jsonl")
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    methods = {method["method"]: method for method in summary["methods"]}
+    sample_rows = [
+        json.loads(line)
+        for line in samples_path.read_text(encoding="utf-8").splitlines()
+    ]
+    token_rows = [
+        json.loads(line)
+        for line in tokens_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert set(methods) == {"base", "random"}
+    assert methods["base"]["samples"] == 1
+    assert methods["base"]["skipped"] == 1
+    assert methods["random"]["samples"] == 1
+    assert methods["random"]["skipped"] == 1
+    assert {row["method"] for row in sample_rows} == {"base", "random"}
+    assert all(row["answer_tokens"] > 0 for row in sample_rows)
+    assert {row["method"] for row in token_rows} == {"base", "random"}

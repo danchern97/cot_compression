@@ -56,6 +56,13 @@ class RunLogger:
         if self.wandb_run is not None:
             self.wandb_run.log(metrics, step=step)
 
+    def log_artifact(self, path: Path) -> None:
+        self.info(f"Saved artifact: {path}")
+        if self.wandb_run is not None:
+            artifact = wandb.Artifact(path.stem, type="evaluation")
+            artifact.add_file(str(path))
+            self.wandb_run.log_artifact(artifact)
+
     def finish(self) -> None:
         for handler in self.logger.handlers:
             handler.close()

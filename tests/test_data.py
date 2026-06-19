@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+from omegaconf import OmegaConf
+
+from cot_compression.compression import (
+    RandomCompressionMethod,
+    build_compression_methods,
+    extend_tokenizer_and_model,
+)
+from cot_compression.data.answers import (
+    extract_answer_trace,
+    find_answer_span,
+    tokenize_answer,
+)
 from cot_compression.data.chat import (
     IGNORE_INDEX,
     QwenChatSFTCollator,
@@ -19,6 +31,14 @@ class FakeChatTokenizer:
         self.pad_token_id = 0
         self.pad_token = "<pad>"
         self.truncation_side = "right"
+        self.added_tokens: list[str] = []
+
+    def __len__(self) -> int:
+        return 100 + len(self.added_tokens)
+
+    def add_tokens(self, tokens) -> int:
+        self.added_tokens.extend(tokens)
+        return len(tokens)
 
     def apply_chat_template(
         self,
@@ -45,13 +65,36 @@ class FakeChatTokenizer:
         assert return_offsets_mapping
         start = max(0, len(text) - max_length) if self.truncation_side == "left" else 0
         text = text[start : start + max_length]
+        input_ids = []
+        offsets = []
+        index = 0
+        added = {token: 100 + i for i, token in enumerate(self.added_tokens)}
+        while index < len(text):
+            match = next(
+                (token for token in self.added_tokens if text.startswith(token, index)),
+                None,
+            )
+            if match is not None:
+                input_ids.append(added[match])
+                offsets.append((start + index, start + index + len(match)))
+                index += len(match)
+            else:
+                input_ids.append((ord(text[index]) % 99) + 1)
+                offsets.append((start + index, start + index + 1))
+                index += 1
         return {
-            "input_ids": [(ord(char) % 100) + 1 for char in text],
-            "attention_mask": [1 for _ in text],
-            "offset_mapping": [
-                (index + start, index + start + 1) for index, _ in enumerate(text)
-            ],
+            "input_ids": input_ids,
+            "attention_mask": [1 for _ in input_ids],
+            "offset_mapping": offsets,
         }
+
+
+class FakeResizeModel:
+    def __init__(self) -> None:
+        self.resize_calls: list[tuple[int, bool]] = []
+
+    def resize_token_embeddings(self, size: int, mean_resizing: bool) -> None:
+        self.resize_calls.append((size, mean_resizing))
 
 
 def test_validate_messages_requires_assistant() -> None:
@@ -125,3 +168,97 @@ def test_chat_collator_masks_padding() -> None:
 
     assert batch["input_ids"].shape[0] == 2
     assert (batch["labels"][batch["attention_mask"] == 0] == IGNORE_INDEX).all()
+
+
+def test_extract_answer_trace() -> None:
+    trace = extract_answer_trace(
+        [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "<think>Trace</think>\nAnswer"},
+        ]
+    )
+
+    assert trace is not None
+    assert trace.trace == "<think>Trace</think>"
+    assert trace.answer == "Answer"
+    assert extract_answer_trace([{"role": "assistant", "content": "No trace"}]) is None
+    assert (
+        extract_answer_trace([{"role": "assistant", "content": "<think>x</think>"}])
+        is None
+    )
+
+
+def test_tokenize_answer_masks_trace_and_scores_answer() -> None:
+    tokenizer = FakeChatTokenizer()
+    messages = [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "<think>Trace</think>\nAnswer"},
+    ]
+    trace = extract_answer_trace(messages)
+    assert trace is not None
+
+    tokenized = tokenize_answer(
+        tokenizer=tokenizer,
+        messages=trace.messages,
+        answer=trace.answer,
+        max_length=128,
+    )
+
+    assert tokenized is not None
+    rendered = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+    assert tokenized.labels[rendered.index("Trace")] == IGNORE_INDEX
+    assert tokenized.labels[rendered.index("Answer")] != IGNORE_INDEX
+
+
+def test_find_answer_span_handles_template_normalized_think_tags() -> None:
+    messages = [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "<think>Trace</think> Answer"},
+    ]
+    rendered = (
+        "<|im_start|>user\nQuestion<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\nTrace\n</think>\n\n Answer<|im_end|>\n"
+    )
+
+    start, end = find_answer_span(messages, rendered, "Answer")
+
+    assert rendered[start:end] == "Answer"
+
+
+def test_random_method_is_deterministic_and_extends_vocab() -> None:
+    tokenizer = FakeChatTokenizer()
+    model = FakeResizeModel()
+    cfg = OmegaConf.create(
+        {
+            "evaluation": {
+                "methods": {
+                    "enabled": ["base", "random"],
+                    "random": {"abstract_vocab_size": 4, "abstract_length": 3},
+                }
+            }
+        }
+    )
+    methods = build_compression_methods(cfg)
+    extend_tokenizer_and_model(tokenizer=tokenizer, model=model, methods=methods)
+
+    trace = extract_answer_trace(
+        [{"role": "assistant", "content": "<think>Trace</think>\nAnswer"}]
+    )
+    assert trace is not None
+    random_method = next(
+        method for method in methods if isinstance(method, RandomCompressionMethod)
+    )
+    first = random_method.transform(trace, sample_index=5, seed=13)
+    second = random_method.transform(trace, sample_index=5, seed=13)
+    third = random_method.transform(trace, sample_index=6, seed=13)
+    content = first[0]["content"]
+
+    assert first == second
+    assert first != third
+    assert content.startswith("<think>")
+    assert "</think>\nAnswer" in content
+    assert "Trace" not in content
+    assert len(tokenizer.added_tokens) == 4
+    assert model.resize_calls == [(104, False)]
