@@ -1,42 +1,28 @@
 # CoT Compression
 
-A small, pure-PyTorch research project for chain-of-thought compression
-experiments. It uses Hydra for configuration, uv for dependency management,
-ruff for formatting/linting, and ty for type checking.
+This project develops embedding initialization schemes for compressing long
+chain-of-thought traces into short sequences of learned abstract tokens. The
+core question is whether a model can condition on compact abstract-token
+representations of reasoning traces while preserving low final-answer loss.
 
-The project includes a plain PyTorch SFT path for Qwen3-4B on Dolci reasoning
-traces. The layout follows this separation:
+We evaluate methods by replacing or preserving the reasoning trace, masking loss
+to answer tokens only, and comparing final answer negative log-likelihood over a
+Dolci dev split. The main baselines are:
+
+- `base`: the original textual `<think>...</think>` chain of thought.
+- `random`: fixed-length abstract tokens with randomly initialized embeddings.
+
+The research goal is to learn or design better abstract-token embedding
+initializations that minimize answer loss relative to these baselines.
+
+The repo uses Hydra for configuration, uv for dependency management, ruff for
+formatting/linting, and ty for type checking. The main layout is:
 
 - `src/cot_compression/data`: loading and preprocessing data.
 - `src/cot_compression/training`: training, logging, and checkpointing.
 - `scripts`: thin Hydra entrypoints that call the package code.
 - `configs`: hierarchical YAML configuration.
 - `tests`: unit and smoke tests.
-
-## Code Style and Philosophy
-
-This project is meant to be read and changed. Prefer short files with one clear
-job over large modules that hide many ideas at once. A researcher should be able
-to open a file, read it top to bottom, and understand what part of the
-experiment it owns.
-
-Keep research logic explicit. The training loop is intentionally written as a
-plain function with visible steps: fetch a batch, run the model, compute loss,
-update parameters, log metrics, evaluate, and checkpoint. Avoid abstractions
-that make those steps hard to find unless they remove real repetition.
-
-Use configuration for experiment choices, not for core program logic. Hydra
-YAML files should describe which dataset, method, optimizer, paths, and training
-settings are used. Python modules should still contain the actual behavior.
-
-Keep scripts thin. Files in `scripts/` should compose a config and call package
-code. Put reusable implementation in `src/cot_compression/`, where it
-can be tested and imported by other scripts.
-
-Write tests for behavior, not implementation trivia. Good tests check that data
-batches are shaped correctly, model losses are finite, checkpoints can be
-loaded, and small end-to-end runs work. They should stay fast enough that
-students run them often.
 
 ## Setup
 
@@ -68,7 +54,7 @@ uv run python scripts/run.py sft data.train_size=1000 data.eval_size=100 trainin
 The SFT path loads `Qwen/Qwen3-4B` in full bf16 by default, so real runs need a
 GPU with enough memory for full-parameter training. It materializes a
 deterministic 600k train plus 2k eval subset from
-`allenai/Dolci-Think-SFT-7B` under `data/dolci_think_sft_600k`, preserves the
+`allenai/Dolci-Think-SFT-32B` under `data/dolci_think_sft_600k`, preserves the
 dataset's existing `<think>...</think>` assistant traces, and trains only on
 assistant-message tokens.
 
@@ -113,3 +99,10 @@ uv run python scripts/run.py training.max_steps=50 data.train_size=1000
 Outputs are written under `outputs/runs/...` by default. Each run contains the
 resolved config, printed logs, checkpoints, wandb files, and generated artifacts.
 The output and report folders are ignored by Git.
+
+## Agent Notes
+
+Keep reusable implementation in `src/cot_compression/` and keep `scripts/` thin.
+Prefer explicit research code over clever abstractions, especially around
+training/evaluation loops. Put disposable local experiments in `one-off/`, which
+is ignored by Git.

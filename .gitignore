@@ -13,6 +13,7 @@ __pycache__/
 outputs/
 reports/
 wandb/
+one-off/
 *.ckpt
 *.pt
 *.pth
