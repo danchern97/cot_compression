@@ -96,21 +96,25 @@ def tokenize_answer(
     tokenizer: Any,
     messages: list[Message],
     answer: str,
-    max_length: int,
+    max_length: int | None,
 ) -> TokenizedAnswer | None:
     rendered = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=False,
     )
-    answer_span = find_answer_span(messages, rendered, answer)
-    tokenized = tokenizer(
-        rendered,
-        add_special_tokens=False,
-        max_length=max_length,
-        truncation=True,
-        return_offsets_mapping=True,
-    )
+    try:
+        answer_span = find_answer_span(messages, rendered, answer)
+    except ValueError:
+        return None
+    tokenize_kwargs = {
+        "add_special_tokens": False,
+        "truncation": max_length is not None,
+        "return_offsets_mapping": True,
+    }
+    if max_length is not None:
+        tokenize_kwargs["max_length"] = max_length
+    tokenized = tokenizer(rendered, **tokenize_kwargs)
 
     input_ids = list(tokenized["input_ids"])
     attention_mask = list(tokenized["attention_mask"])

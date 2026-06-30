@@ -19,6 +19,7 @@ from cot_compression.data.chat import (
     tokenize_chat_for_sft,
 )
 from cot_compression.data.dolci import (
+    has_valid_messages,
     select_deterministic_subset,
     validate_messages,
 )
@@ -115,12 +116,37 @@ def test_select_deterministic_subset() -> None:
         [{"messages": [{"role": "assistant", "content": str(i)}]} for i in range(10)]
     )
 
-    first = select_deterministic_subset(dataset, train_size=4, eval_size=2, seed=7)
-    second = select_deterministic_subset(dataset, train_size=4, eval_size=2, seed=7)
+    first = select_deterministic_subset(
+        dataset,
+        train_size=4,
+        eval_size=2,
+        test_size=3,
+        seed=7,
+    )
+    second = select_deterministic_subset(
+        dataset,
+        train_size=4,
+        eval_size=2,
+        test_size=3,
+        seed=7,
+    )
 
     assert first["train"]["messages"] == second["train"]["messages"]
     assert len(first["train"]) == 4
     assert len(first["eval"]) == 2
+    assert len(first["test"]) == 3
+
+
+def test_invalid_dolci_messages_can_be_filtered() -> None:
+    assert has_valid_messages(
+        {
+            "messages": [
+                {"role": "user", "content": "Question"},
+                {"role": "assistant", "content": "Answer"},
+            ]
+        }
+    )
+    assert not has_valid_messages({"messages": [{"role": "assistant", "content": ""}]})
 
 
 def test_chat_tokenization_masks_non_assistant_tokens() -> None:

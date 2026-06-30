@@ -1,0 +1,9 @@
+name: dolci_think_sft_32b_600k
+source_name: allenai/Dolci-Think-SFT-32B
+source_config: null
+source_split: train
+prepared_dir: ${paths.data_dir}/dolci_think_sft_32b_600k
+train_size: 600000
+eval_size: 20000
+test_size: 100000
+seed: 1337

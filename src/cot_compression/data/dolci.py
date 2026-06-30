@@ -14,6 +14,7 @@ Message = dict[str, str]
 class DolciSFTData:
     train: Dataset
     eval: Dataset
+    test: Dataset
 
 
 def validate_messages(messages: object) -> list[Message]:
@@ -42,13 +43,22 @@ def validate_messages(messages: object) -> list[Message]:
     return validated
 
 
+def has_valid_messages(example: dict[str, Any]) -> bool:
+    try:
+        validate_messages(example.get("messages"))
+    except ValueError:
+        return False
+    return True
+
+
 def select_deterministic_subset(
     dataset: Dataset,
     train_size: int,
     eval_size: int,
+    test_size: int,
     seed: int,
 ) -> DatasetDict:
-    required = train_size + eval_size
+    required = train_size + eval_size + test_size
     if len(dataset) < required:
         raise ValueError(
             f"Dataset has {len(dataset)} rows, but {required} are required."
@@ -59,7 +69,8 @@ def select_deterministic_subset(
     return DatasetDict(
         {
             "train": subset.select(range(train_size)),
-            "eval": subset.select(range(train_size, required)),
+            "eval": subset.select(range(train_size, train_size + eval_size)),
+            "test": subset.select(range(train_size + eval_size, required)),
         }
     )
 
@@ -73,17 +84,36 @@ def _keep_sft_columns(example: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _expected_split_sizes(cfg: DictConfig) -> dict[str, int]:
+    return {
+        "train": int(cfg.data.train_size),
+        "eval": int(cfg.data.eval_size),
+        "test": int(cfg.data.test_size),
+    }
+
+
+def _validate_split_sizes(dataset_dict: DatasetDict, cfg: DictConfig) -> None:
+    expected = _expected_split_sizes(cfg)
+    actual = {split: len(dataset_dict[split]) for split in dataset_dict}
+    if actual != expected:
+        raise ValueError(
+            "Prepared Dolci split sizes do not match config. "
+            f"Expected {expected}, found {actual}."
+        )
+
+
 def _prepare_subset(cfg: DictConfig) -> DatasetDict:
     source = load_dataset(
         str(cfg.data.source_name),
         name=cfg.data.get("source_config"),
         split=str(cfg.data.source_split),
     )
-    dataset = source
+    dataset = source.filter(has_valid_messages, desc="Filtering invalid Dolci rows")
     subset = select_deterministic_subset(
         dataset=dataset,
         train_size=int(cfg.data.train_size),
         eval_size=int(cfg.data.eval_size),
+        test_size=int(cfg.data.test_size),
         seed=int(cfg.data.seed),
     )
     return subset.map(
@@ -100,12 +130,15 @@ def load_dolci_sft_data(cfg: DictConfig) -> DolciSFTData:
         if not isinstance(loaded, DatasetDict):
             raise ValueError(f"Expected a DatasetDict at {prepared_dir}.")
         dataset_dict = loaded
+        _validate_split_sizes(dataset_dict, cfg)
     else:
         prepared_dir.parent.mkdir(parents=True, exist_ok=True)
         dataset_dict = _prepare_subset(cfg)
+        _validate_split_sizes(dataset_dict, cfg)
         dataset_dict.save_to_disk(str(prepared_dir))
 
     return DolciSFTData(
         train=dataset_dict["train"],
         eval=dataset_dict["eval"],
+        test=dataset_dict["test"],
     )
