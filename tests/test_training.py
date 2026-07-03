@@ -57,13 +57,18 @@ class FakeSFTTokenizer:
         self,
         text: str,
         add_special_tokens: bool,
-        max_length: int,
-        truncation: bool,
-        return_offsets_mapping: bool,
+        max_length: int | None = None,
+        truncation: bool = False,
+        return_offsets_mapping: bool = True,
     ):
         del add_special_tokens, truncation, return_offsets_mapping
-        start = max(0, len(text) - max_length) if self.truncation_side == "left" else 0
-        text = text[start : start + max_length]
+        if max_length is None:
+            start = 0
+        else:
+            start = (
+                max(0, len(text) - max_length) if self.truncation_side == "left" else 0
+            )
+            text = text[start : start + max_length]
         input_ids = []
         offsets = []
         index = 0
@@ -149,7 +154,7 @@ def test_plain_sft_training_step(monkeypatch, tmp_path) -> None:
     )
     monkeypatch.setattr(
         "cot_compression.training.sft.load_dolci_sft_data",
-        lambda cfg: DolciSFTData(train=examples, eval=examples),
+        lambda cfg: DolciSFTData(train=examples, eval=examples, test=examples),
     )
 
     cfg = OmegaConf.create(
@@ -241,7 +246,7 @@ def test_answer_loss_evaluation_smoke(monkeypatch, tmp_path) -> None:
     )
     monkeypatch.setattr(
         "cot_compression.training.evaluate.load_dolci_sft_data",
-        lambda cfg: DolciSFTData(train=examples, eval=examples),
+        lambda cfg: DolciSFTData(train=examples, eval=examples, test=examples),
     )
 
     cfg = OmegaConf.create(
@@ -257,11 +262,13 @@ def test_answer_loss_evaluation_smoke(monkeypatch, tmp_path) -> None:
                 "seed": 7,
                 "device": "cpu",
                 "torch_dtype": "float32",
-                "max_length": 128,
+                "max_length": None,
+                "batch_size": 2,
+                "max_batch_tokens": 512,
                 "max_examples": None,
-                "metric": "answer_nll",
+                "metric": "answer_logprob",
                 "normalize_by_length": True,
-                "save_token_losses": True,
+                "save_token_logprobs": True,
                 "methods": {
                     "enabled": ["base", "random"],
                     "random": {
@@ -299,10 +306,14 @@ def test_answer_loss_evaluation_smoke(monkeypatch, tmp_path) -> None:
     ]
 
     assert set(methods) == {"base", "random"}
+    assert summary["metric"] == "answer_logprob"
     assert methods["base"]["samples"] == 1
+    assert "mean_logprob" in methods["base"]
     assert methods["base"]["skipped"] == 1
     assert methods["random"]["samples"] == 1
     assert methods["random"]["skipped"] == 1
     assert {row["method"] for row in sample_rows} == {"base", "random"}
     assert all(row["answer_tokens"] > 0 for row in sample_rows)
+    assert all("logprob_mean" in row for row in sample_rows)
     assert {row["method"] for row in token_rows} == {"base", "random"}
+    assert all("logprob" in row for row in token_rows)

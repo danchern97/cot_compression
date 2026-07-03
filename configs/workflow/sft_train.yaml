@@ -2,7 +2,7 @@
 
 defaults:
   - /paths: default
-  - /data: dolci_think_sft_600k
+  - /data: dolci_think_sft_7b_600k
   - /method: qwen3/4b
   - /training: sft_full_bf16
   - /optim: adamw

@@ -31,23 +31,23 @@ from cot_compression.training.utils import (
 
 
 @dataclass(frozen=True)
-class SampleLoss:
+class SampleScore:
     method: str
     sample_index: int
     sample_id: str | None
     dataset_source: str | None
     answer_tokens: int
-    loss_sum: float
-    loss_mean: float
+    logprob_sum: float
+    logprob_mean: float
 
 
 @dataclass(frozen=True)
-class TokenLoss:
+class TokenScore:
     method: str
     sample_index: int
     token_index: int
     token_id: int
-    loss: float
+    logprob: float
 
 
 @dataclass(frozen=True)
@@ -55,11 +55,21 @@ class MethodSummary:
     method: str
     samples: int
     skipped: int
-    mean_loss: float
-    std_loss: float
-    sem_loss: float
-    mean_loss_sum: float
+    mean_logprob: float
+    std_logprob: float
+    sem_logprob: float
+    mean_logprob_sum: float
     mean_answer_tokens: float
+
+
+@dataclass(frozen=True)
+class PreparedSample:
+    sample_index: int
+    sample_id: str | None
+    dataset_source: str | None
+    input_ids: list[int]
+    attention_mask: list[int]
+    labels: list[int]
 
 
 def build_eval_model_and_tokenizer(
@@ -87,66 +97,100 @@ def build_eval_model_and_tokenizer(
     return model.to(device).eval(), tokenizer
 
 
-def compute_answer_losses(
+def optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def batch_would_exceed_limit(
+    batch: list[PreparedSample],
+    candidate: PreparedSample,
+    max_batch_tokens: int | None,
+) -> bool:
+    if max_batch_tokens is None or not batch:
+        return False
+    max_length = max(
+        max(len(sample.input_ids) for sample in batch),
+        len(candidate.input_ids),
+    )
+    return max_length * (len(batch) + 1) > max_batch_tokens
+
+
+def compute_batch_answer_logprobs(
     model: torch.nn.Module,
-    input_ids: list[int],
-    attention_mask: list[int],
-    labels: list[int],
+    batch: list[PreparedSample],
+    pad_token_id: int,
     device: torch.device,
-) -> tuple[float, list[tuple[int, int, float]]]:
-    input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
-    attention_tensor = torch.tensor([attention_mask], dtype=torch.long, device=device)
-    label_tensor = torch.tensor([labels], dtype=torch.long, device=device)
+) -> list[tuple[float, list[tuple[int, int, float]]]]:
+    max_length = max(len(sample.input_ids) for sample in batch)
+    input_rows = []
+    attention_rows = []
+    label_rows = []
+    for sample in batch:
+        pad = max_length - len(sample.input_ids)
+        input_rows.append(sample.input_ids + [pad_token_id] * pad)
+        attention_rows.append(sample.attention_mask + [0] * pad)
+        label_rows.append(sample.labels + [IGNORE_INDEX] * pad)
+
+    input_tensor = torch.tensor(input_rows, dtype=torch.long, device=device)
+    attention_tensor = torch.tensor(attention_rows, dtype=torch.long, device=device)
+    label_tensor = torch.tensor(label_rows, dtype=torch.long, device=device)
 
     with torch.no_grad():
         outputs = model(input_ids=input_tensor, attention_mask=attention_tensor)
         logits = outputs.logits[:, :-1, :]
         shifted_labels = label_tensor[:, 1:]
         shifted_positions = torch.arange(1, label_tensor.size(1), device=device)
-        loss = F.cross_entropy(
+        nll = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             shifted_labels.reshape(-1),
             ignore_index=IGNORE_INDEX,
             reduction="none",
         ).view_as(shifted_labels)
 
-    mask = shifted_labels != IGNORE_INDEX
-    if not bool(mask.any().item()):
-        raise ValueError("No answer tokens were available for loss computation.")
+    results = []
+    expanded_positions = shifted_positions.expand_as(shifted_labels)
+    for row_index in range(len(batch)):
+        row_labels = shifted_labels[row_index]
+        row_mask = row_labels != IGNORE_INDEX
+        if not bool(row_mask.any().item()):
+            raise ValueError("No answer tokens were available for loss computation.")
 
-    loss_values = loss[mask]
-    token_ids = shifted_labels[mask]
-    positions = shifted_positions.expand_as(shifted_labels)[mask]
-    token_losses = [
-        (int(position.item()), int(token_id.item()), float(token_loss.item()))
-        for position, token_id, token_loss in zip(
-            positions,
-            token_ids,
-            loss_values,
-            strict=True,
-        )
-    ]
-    return float(loss_values.sum().item()), token_losses
+        logprob_values = -nll[row_index][row_mask]
+        token_ids = row_labels[row_mask]
+        positions = expanded_positions[row_index][row_mask]
+        token_logprobs = [
+            (int(position.item()), int(token_id.item()), float(token_logprob.item()))
+            for position, token_id, token_logprob in zip(
+                positions,
+                token_ids,
+                logprob_values,
+                strict=True,
+            )
+        ]
+        results.append((float(logprob_values.sum().item()), token_logprobs))
+    return results
 
 
 def summarize_method(
     method: str,
-    samples: list[SampleLoss],
+    samples: list[SampleScore],
     skipped: int,
 ) -> MethodSummary:
-    losses = [sample.loss_mean for sample in samples]
-    summed_losses = [sample.loss_sum for sample in samples]
+    logprobs = [sample.logprob_mean for sample in samples]
+    summed_logprobs = [sample.logprob_sum for sample in samples]
     token_counts = [sample.answer_tokens for sample in samples]
-    std = statistics.stdev(losses) if len(losses) > 1 else 0.0
+    std = statistics.stdev(logprobs) if len(logprobs) > 1 else 0.0
     return MethodSummary(
         method=method,
         samples=len(samples),
         skipped=skipped,
-        mean_loss=sum(losses) / len(losses) if losses else float("nan"),
-        std_loss=std,
-        sem_loss=std / math.sqrt(len(losses)) if losses else float("nan"),
-        mean_loss_sum=sum(summed_losses) / len(summed_losses)
-        if summed_losses
+        mean_logprob=sum(logprobs) / len(logprobs) if logprobs else float("nan"),
+        std_logprob=std,
+        sem_logprob=std / math.sqrt(len(logprobs)) if logprobs else float("nan"),
+        mean_logprob_sum=sum(summed_logprobs) / len(summed_logprobs)
+        if summed_logprobs
         else float("nan"),
         mean_answer_tokens=sum(token_counts) / len(token_counts)
         if token_counts
@@ -167,7 +211,7 @@ def evaluate_method(
     tokenizer: Any,
     cfg: DictConfig,
     device: torch.device,
-) -> tuple[MethodSummary, list[SampleLoss], list[TokenLoss]]:
+) -> tuple[MethodSummary, list[SampleScore], list[TokenScore]]:
     samples = []
     token_rows = []
     skipped = 0
@@ -175,7 +219,50 @@ def evaluate_method(
     limit = (
         len(dataset) if max_examples is None else min(len(dataset), int(max_examples))
     )
+    max_length = optional_int(cfg.evaluation.max_length)
+    batch_size = int(cfg.evaluation.batch_size)
+    max_batch_tokens = optional_int(cfg.evaluation.max_batch_tokens)
+    pad_token_id = int(tokenizer.pad_token_id)
 
+    def score_batch(batch: list[PreparedSample]) -> None:
+        if not batch:
+            return
+        batch_results = compute_batch_answer_logprobs(
+            model=model,
+            batch=batch,
+            pad_token_id=pad_token_id,
+            device=device,
+        )
+        for prepared, (logprob_sum, token_logprobs) in zip(
+            batch,
+            batch_results,
+            strict=True,
+        ):
+            answer_tokens = len(token_logprobs)
+            sample = SampleScore(
+                method=method.name,
+                sample_index=prepared.sample_index,
+                sample_id=prepared.sample_id,
+                dataset_source=prepared.dataset_source,
+                answer_tokens=answer_tokens,
+                logprob_sum=logprob_sum,
+                logprob_mean=logprob_sum / answer_tokens,
+            )
+            samples.append(sample)
+
+            if bool(cfg.evaluation.save_token_logprobs):
+                token_rows.extend(
+                    TokenScore(
+                        method=method.name,
+                        sample_index=prepared.sample_index,
+                        token_index=token_index,
+                        token_id=token_id,
+                        logprob=logprob,
+                    )
+                    for token_index, token_id, logprob in token_logprobs
+                )
+
+    batch = []
     for sample_index in range(limit):
         example = dataset[sample_index]
         trace = extract_answer_trace(example["messages"])
@@ -192,42 +279,29 @@ def evaluate_method(
             tokenizer=tokenizer,
             messages=messages,
             answer=trace.answer,
-            max_length=int(cfg.evaluation.max_length),
+            max_length=max_length,
         )
         if tokenized is None:
             skipped += 1
             continue
 
-        loss_sum, token_losses = compute_answer_losses(
-            model=model,
-            input_ids=tokenized.input_ids,
-            attention_mask=tokenized.attention_mask,
-            labels=tokenized.labels,
-            device=device,
-        )
-        answer_tokens = len(token_losses)
-        sample = SampleLoss(
-            method=method.name,
+        prepared = PreparedSample(
             sample_index=sample_index,
             sample_id=example.get("id"),
             dataset_source=example.get("dataset_source"),
-            answer_tokens=answer_tokens,
-            loss_sum=loss_sum,
-            loss_mean=loss_sum / answer_tokens,
+            input_ids=tokenized.input_ids,
+            attention_mask=tokenized.attention_mask,
+            labels=tokenized.labels,
         )
-        samples.append(sample)
+        if batch_would_exceed_limit(batch, prepared, max_batch_tokens):
+            score_batch(batch)
+            batch = []
+        batch.append(prepared)
+        if len(batch) >= batch_size:
+            score_batch(batch)
+            batch = []
 
-        if bool(cfg.evaluation.save_token_losses):
-            token_rows.extend(
-                TokenLoss(
-                    method=method.name,
-                    sample_index=sample_index,
-                    token_index=token_index,
-                    token_id=token_id,
-                    loss=loss,
-                )
-                for token_index, token_id, loss in token_losses
-            )
+    score_batch(batch)
 
     return summarize_method(method.name, samples, skipped), samples, token_rows
 
@@ -267,8 +341,8 @@ def evaluate_methods(cfg: DictConfig) -> Path:
             token_rows.extend(tokens)
             logger.log_metrics(
                 {
-                    f"{method.name}/mean_loss": summary.mean_loss,
-                    f"{method.name}/std_loss": summary.std_loss,
+                    f"{method.name}/mean_logprob": summary.mean_logprob,
+                    f"{method.name}/std_logprob": summary.std_logprob,
                     f"{method.name}/samples": float(summary.samples),
                     f"{method.name}/skipped": float(summary.skipped),
                 },
@@ -295,7 +369,7 @@ def evaluate_methods(cfg: DictConfig) -> Path:
         )
         write_jsonl(samples_path, [asdict(sample) for sample in sample_rows])
         paths = [summary_path, samples_path]
-        if bool(cfg.evaluation.save_token_losses):
+        if bool(cfg.evaluation.save_token_logprobs):
             write_jsonl(tokens_path, [asdict(token) for token in token_rows])
             paths.append(tokens_path)
 

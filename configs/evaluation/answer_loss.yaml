@@ -1,11 +1,13 @@
 seed: 1337
 device: auto
 torch_dtype: bfloat16
-max_length: 4096
+max_length: null
+batch_size: 4
+max_batch_tokens: 32768
 max_examples: null
-metric: answer_nll
+metric: answer_logprob
 normalize_by_length: true
-save_token_losses: true
+save_token_logprobs: true
 methods:
   enabled:
     - base

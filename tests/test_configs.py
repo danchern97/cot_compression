@@ -16,10 +16,26 @@ def test_hydra_configs_compose() -> None:
             config_name="run",
             overrides=["workflow=evaluate_methods", "logging.enabled=false"],
         )
+        eval_32b_cfg = compose(
+            config_name="run",
+            overrides=[
+                "workflow=evaluate_methods",
+                "data=dolci_think_sft_32b_600k",
+                "logging.enabled=false",
+            ],
+        )
 
     assert sft_cfg.mode == "sft_train"
     assert sft_cfg.method.model_name == "Qwen/Qwen3-4B"
+    assert sft_cfg.data.source_name == "allenai/Dolci-Think-SFT-7B"
+    assert sft_cfg.data.name == "dolci_think_sft_7b_600k"
+    assert sft_cfg.data.eval_size == 20000
+    assert sft_cfg.data.test_size == 100000
     assert sft_cfg.training.torch_dtype == "bfloat16"
     assert eval_cfg.mode == "evaluate_methods"
     assert eval_cfg.method.model_name == "Qwen/Qwen3-0.6B"
+    assert eval_cfg.evaluation.max_length is None
+    assert eval_cfg.evaluation.batch_size == 4
     assert eval_cfg.evaluation.methods.random.abstract_length == 128
+    assert eval_32b_cfg.data.source_name == "allenai/Dolci-Think-SFT-32B"
+    assert eval_32b_cfg.data.name == "dolci_think_sft_32b_600k"

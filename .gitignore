@@ -19,6 +19,9 @@ one-off/
 *.pth
 
 # Generated data artifacts
+data/dolci_think_sft_600k/
+data/dolci_think_sft_32b_600k/
+data/dolci_think_sft_7b_600k/
 data/**/train.npy
 data/**/val.npy
 data/**/tokenizer.json
