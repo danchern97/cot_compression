@@ -63,9 +63,9 @@ class RunLogger:
             artifact.add_file(str(path))
             self.wandb_run.log_artifact(artifact)
 
-    def finish(self) -> None:
+    def finish(self, exit_code: int = 0) -> None:
         for handler in self.logger.handlers:
             handler.close()
         self.logger.handlers.clear()
         if self.wandb_run is not None:
-            self.wandb_run.finish()
+            self.wandb_run.finish(exit_code=exit_code)

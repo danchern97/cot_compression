@@ -375,6 +375,9 @@ def evaluate_methods(cfg: DictConfig) -> Path:
 
         for path in paths:
             logger.log_artifact(path)
-        return summary_path
-    finally:
+    except Exception:
+        logger.finish(exit_code=1)
+        raise
+    else:
         logger.finish()
+        return summary_path
