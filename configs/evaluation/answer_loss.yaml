@@ -15,3 +15,17 @@ methods:
   random:
     abstract_vocab_size: 1024
     abstract_length: 128
+    isolate_cot_context: false
+    patching: null
+  patching:
+    uniform:
+      patch_size: 8
+    random:
+      max_exponent: 6
+    entropy:
+      percentile: 80.0
+  simple_mean:
+    patching: null
+  entropy_weighted_mean:
+    isolate_cot_context: false
+    patching: null

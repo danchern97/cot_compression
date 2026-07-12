@@ -25,6 +25,7 @@ from cot_compression.training.sft_loop import (
 )
 from cot_compression.training.utils import (
     get_run_dir,
+    optional_int,
     resolve_device,
     save_resolved_config,
     set_seed,
@@ -41,12 +42,6 @@ def parse_torch_dtype(name: str) -> torch.dtype | str:
     if name == "float32":
         return torch.float32
     raise ValueError(f"Unknown torch dtype: {name}")
-
-
-def optional_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    return int(value)
 
 
 def count_optimizer_steps(

@@ -24,6 +24,12 @@ def resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
+def optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
 def get_run_dir(cfg: DictConfig) -> Path:
     run_dir = cfg.paths.get("run_dir")
     if run_dir is not None:

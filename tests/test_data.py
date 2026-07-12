@@ -261,7 +261,13 @@ def test_random_method_is_deterministic_and_extends_vocab() -> None:
             "evaluation": {
                 "methods": {
                     "enabled": ["base", "random"],
-                    "random": {"abstract_vocab_size": 4, "abstract_length": 3},
+                    "random": {
+                        "abstract_vocab_size": 4,
+                        "abstract_length": 3,
+                        "patching": None,
+                        "isolate_cot_context": False,
+                    },
+                    "patching": {},
                 }
             }
         }

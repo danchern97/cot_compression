@@ -22,7 +22,10 @@ def merge(*by_method: dict[str, list[float]]) -> dict[str, list[float]]:
 
 
 def run(multirun_dir: Path, out: Path) -> None:
-    artifacts_dirs = sorted(multirun_dir.glob("*/artifacts"))
+    # Recursive glob so multiple multirun sweeps can be nested under one
+    # root directory (e.g. multirun_dir/<compression_mode>/<job_num>/artifacts)
+    # without colliding on Hydra's per-invocation job numbering.
+    artifacts_dirs = sorted(multirun_dir.glob("**/artifacts"))
     sample_logprobs = merge(
         *(load_sample_logprobs(d / "samples.jsonl") for d in artifacts_dirs)
     )
@@ -40,7 +43,7 @@ def run(multirun_dir: Path, out: Path) -> None:
     )
     plot_density(
         sample_probabilities,
-        title="Distribution of sample probability: base vs random",
+        title="Distribution of sample probability by method",
         xlabel="Probability",
         out_path=out / "sample_probability_density",
     )
@@ -52,7 +55,7 @@ def run(multirun_dir: Path, out: Path) -> None:
     )
     plot_density(
         sample_logprobs,
-        title="Distribution of logprob_mean: base vs random",
+        title="Distribution of logprob_mean by method",
         xlabel="logprob_mean",
         out_path=out / "sample_logprob_density",
     )
@@ -64,7 +67,7 @@ def run(multirun_dir: Path, out: Path) -> None:
     )
     plot_density(
         token_probabilities,
-        title="Distribution of token probability: base vs random",
+        title="Distribution of token probability by method",
         xlabel="Probability",
         out_path=out / "token_probability_density",
     )
@@ -76,7 +79,7 @@ def run(multirun_dir: Path, out: Path) -> None:
     )
     plot_density(
         token_logprobs,
-        title="Distribution of logprob: base vs random",
+        title="Distribution of logprob by method",
         xlabel="logprob",
         out_path=out / "token_logprob_density",
     )

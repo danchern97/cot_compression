@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,6 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cot_compression.compression import (
     CompressionMethod,
+    EmbeddingCompressionMethod,
     build_compression_methods,
     extend_tokenizer_and_model,
 )
@@ -24,6 +25,7 @@ from cot_compression.training.logging import RunLogger
 from cot_compression.training.sft import parse_torch_dtype
 from cot_compression.training.utils import (
     get_run_dir,
+    optional_int,
     resolve_device,
     save_resolved_config,
     set_seed,
@@ -70,6 +72,8 @@ class PreparedSample:
     input_ids: list[int]
     attention_mask: list[int]
     labels: list[int]
+    slot_positions: list[int] = field(default_factory=list)
+    slot_embeddings: torch.Tensor | None = None
 
 
 def build_eval_model_and_tokenizer(
@@ -97,12 +101,6 @@ def build_eval_model_and_tokenizer(
     return model.to(device).eval(), tokenizer
 
 
-def optional_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    return int(value)
-
-
 def batch_would_exceed_limit(
     batch: list[PreparedSample],
     candidate: PreparedSample,
@@ -117,12 +115,11 @@ def batch_would_exceed_limit(
     return max_length * (len(batch) + 1) > max_batch_tokens
 
 
-def compute_batch_answer_logprobs(
-    model: torch.nn.Module,
+def _pad_batch(
     batch: list[PreparedSample],
     pad_token_id: int,
     device: torch.device,
-) -> list[tuple[float, list[tuple[int, int, float]]]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     max_length = max(len(sample.input_ids) for sample in batch)
     input_rows = []
     attention_rows = []
@@ -133,25 +130,31 @@ def compute_batch_answer_logprobs(
         attention_rows.append(sample.attention_mask + [0] * pad)
         label_rows.append(sample.labels + [IGNORE_INDEX] * pad)
 
-    input_tensor = torch.tensor(input_rows, dtype=torch.long, device=device)
-    attention_tensor = torch.tensor(attention_rows, dtype=torch.long, device=device)
-    label_tensor = torch.tensor(label_rows, dtype=torch.long, device=device)
+    return (
+        torch.tensor(input_rows, dtype=torch.long, device=device),
+        torch.tensor(attention_rows, dtype=torch.long, device=device),
+        torch.tensor(label_rows, dtype=torch.long, device=device),
+    )
 
-    with torch.no_grad():
-        outputs = model(input_ids=input_tensor, attention_mask=attention_tensor)
-        logits = outputs.logits[:, :-1, :]
-        shifted_labels = label_tensor[:, 1:]
-        shifted_positions = torch.arange(1, label_tensor.size(1), device=device)
-        nll = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            shifted_labels.reshape(-1),
-            ignore_index=IGNORE_INDEX,
-            reduction="none",
-        ).view_as(shifted_labels)
+
+def _answer_logprobs_from_logits(
+    logits: torch.Tensor,
+    label_tensor: torch.Tensor,
+    device: torch.device,
+) -> list[tuple[float, list[tuple[int, int, float]]]]:
+    logits = logits[:, :-1, :]
+    shifted_labels = label_tensor[:, 1:]
+    shifted_positions = torch.arange(1, label_tensor.size(1), device=device)
+    nll = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        shifted_labels.reshape(-1),
+        ignore_index=IGNORE_INDEX,
+        reduction="none",
+    ).view_as(shifted_labels)
 
     results = []
     expanded_positions = shifted_positions.expand_as(shifted_labels)
-    for row_index in range(len(batch)):
+    for row_index in range(shifted_labels.size(0)):
         row_labels = shifted_labels[row_index]
         row_mask = row_labels != IGNORE_INDEX
         if not bool(row_mask.any().item()):
@@ -171,6 +174,39 @@ def compute_batch_answer_logprobs(
         ]
         results.append((float(logprob_values.sum().item()), token_logprobs))
     return results
+
+
+def compute_batch_answer_logprobs(
+    model: torch.nn.Module,
+    batch: list[PreparedSample],
+    pad_token_id: int,
+    device: torch.device,
+) -> list[tuple[float, list[tuple[int, int, float]]]]:
+    input_tensor, attention_tensor, label_tensor = _pad_batch(batch, pad_token_id, device)
+    with torch.no_grad():
+        outputs = model(input_ids=input_tensor, attention_mask=attention_tensor)
+    return _answer_logprobs_from_logits(outputs.logits, label_tensor, device)
+
+
+def compute_batch_answer_logprobs_from_embeds(
+    model: torch.nn.Module,
+    batch: list[PreparedSample],
+    pad_token_id: int,
+    device: torch.device,
+) -> list[tuple[float, list[tuple[int, int, float]]]]:
+    input_tensor, attention_tensor, label_tensor = _pad_batch(batch, pad_token_id, device)
+    with torch.no_grad():
+        embeds = cast(Any, model).get_input_embeddings()(input_tensor)
+        for row_index, sample in enumerate(batch):
+            assert sample.slot_embeddings is not None
+            for position, vector in zip(
+                sample.slot_positions, sample.slot_embeddings, strict=True
+            ):
+                embeds[row_index, position] = vector.to(
+                    device=embeds.device, dtype=embeds.dtype
+                )
+        outputs = model(inputs_embeds=embeds, attention_mask=attention_tensor)
+    return _answer_logprobs_from_logits(outputs.logits, label_tensor, device)
 
 
 def summarize_method(
@@ -224,10 +260,16 @@ def evaluate_method(
     max_batch_tokens = optional_int(cfg.evaluation.max_batch_tokens)
     pad_token_id = int(tokenizer.pad_token_id)
 
+    score_fn = (
+        compute_batch_answer_logprobs_from_embeds
+        if method.requires_model_embeddings()
+        else compute_batch_answer_logprobs
+    )
+
     def score_batch(batch: list[PreparedSample]) -> None:
         if not batch:
             return
-        batch_results = compute_batch_answer_logprobs(
+        batch_results = score_fn(
             model=model,
             batch=batch,
             pad_token_id=pad_token_id,
@@ -270,11 +312,28 @@ def evaluate_method(
             skipped += 1
             continue
 
-        messages = method.transform(
-            trace=trace,
-            sample_index=sample_index,
-            seed=int(cfg.evaluation.seed),
-        )
+        slot_embeddings = None
+        if method.requires_model_embeddings():
+            embedded = cast(EmbeddingCompressionMethod, method).prepare(
+                trace=trace,
+                tokenizer=tokenizer,
+                model=model,
+                device=device,
+                sample_index=sample_index,
+                seed=int(cfg.evaluation.seed),
+            )
+            messages = embedded.messages
+            slot_embeddings = embedded.slot_embeddings
+        else:
+            messages = method.transform(
+                trace=trace,
+                sample_index=sample_index,
+                seed=int(cfg.evaluation.seed),
+                tokenizer=tokenizer,
+                model=model,
+                device=device,
+            )
+
         tokenized = tokenize_answer(
             tokenizer=tokenizer,
             messages=messages,
@@ -285,6 +344,21 @@ def evaluate_method(
             skipped += 1
             continue
 
+        slot_positions: list[int] = []
+        if slot_embeddings is not None:
+            slot_token_id = tokenizer.convert_tokens_to_ids(
+                cast(EmbeddingCompressionMethod, method).slot_token
+            )
+            slot_positions = [
+                position
+                for position, token_id in enumerate(tokenized.input_ids)
+                if token_id == slot_token_id
+            ]
+            if len(slot_positions) != slot_embeddings.size(0):
+                # Truncation by max_length cut off some placeholder slots.
+                skipped += 1
+                continue
+
         prepared = PreparedSample(
             sample_index=sample_index,
             sample_id=example.get("id"),
@@ -292,6 +366,8 @@ def evaluate_method(
             input_ids=tokenized.input_ids,
             attention_mask=tokenized.attention_mask,
             labels=tokenized.labels,
+            slot_positions=slot_positions,
+            slot_embeddings=slot_embeddings,
         )
         if batch_would_exceed_limit(batch, prepared, max_batch_tokens):
             score_batch(batch)
