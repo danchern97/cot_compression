@@ -30,29 +30,18 @@ def _prefix_ids(trace: AnswerTrace, tokenizer: Any) -> list[int]:
 
     Used so the entropy forward pass can see the same prompt context the
     main answer-logprob forward pass sees, instead of scoring the CoT in
-    isolation. Walks messages with a cursor (rather than a global
-    `rendered.find(trace.trace)`) so a trace that happens to duplicate
-    earlier chat text doesn't get matched to the wrong occurrence.
+    isolation.
     """
     rendered = tokenizer.apply_chat_template(
         trace.messages, tokenize=False, add_generation_prompt=False
     )
-    cursor = 0
-    for index, message in enumerate(trace.messages):
-        content = message["content"]
-        start = rendered.find(content, cursor)
-        if start == -1:
-            raise ValueError("Could not find message content in rendered chat.")
-        if index == trace.assistant_index:
-            trace_start = rendered.find(trace.trace, start, start + len(content))
-            if trace_start == -1:
-                raise ValueError("Could not find CoT trace text in rendered chat.")
-            prefix_text = rendered[:trace_start]
-            if not prefix_text:
-                return []
-            return list(tokenizer(prefix_text, add_special_tokens=False)["input_ids"])
-        cursor = start + len(content)
-    raise ValueError("Could not find assistant message in rendered chat.")
+    trace_start = rendered.rfind(trace.trace)
+    if trace_start == -1:
+        raise ValueError("Could not find CoT trace text in rendered chat.")
+    prefix_text = rendered[:trace_start]
+    if not prefix_text:
+        return []
+    return list(tokenizer(prefix_text, add_special_tokens=False)["input_ids"])
 
 
 def _token_entropies(
