@@ -31,6 +31,28 @@ formatting/linting, and ty for type checking. The main layout is:
 uv sync
 ```
 
+### Storage on Snellius
+
+Home has a 200 GB quota, which the HuggingFace cache (models + full Dolci
+source) quickly exceeds. Keep the cache on `/scratch-shared` by exporting
+`HF_HOME` before running anything that touches HuggingFace:
+
+```bash
+export HF_HOME=/scratch-shared/$USER/huggingface   # add this to ~/.bashrc
+```
+
+This one variable relocates both the hub cache (`$HF_HOME/hub`) and the datasets
+cache (`$HF_HOME/datasets`). For SLURM sweeps, use the committed launcher config
+`configs/hydra/launcher/snellius_h100.yaml`, which exports the same variable
+inside each job:
+
+```bash
+uv run python scripts/run.py -m hydra/launcher=snellius_h100 sft
+```
+
+Note: `/scratch-shared` is periodically purged (files unused for ~14 days), so
+the cache may be re-downloaded from time to time.
+
 ## Common Commands
 
 Fine-tune Qwen3-4B on the Dolci reasoning SFT subset with a plain PyTorch loop:

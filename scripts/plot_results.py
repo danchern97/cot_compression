@@ -26,14 +26,17 @@ def run(multirun_dir: Path, out: Path) -> None:
     # root directory (e.g. multirun_dir/<compression_mode>/<job_num>/artifacts)
     # without colliding on Hydra's per-invocation job numbering.
     artifacts_dirs = sorted(multirun_dir.glob("**/artifacts"))
-    sample_logprobs = merge(
-        *(load_sample_logprobs(d / "samples.jsonl") for d in artifacts_dirs)
-    )
-    token_logprobs = merge(
-        *(load_token_logprobs(d / "tokens.jsonl") for d in artifacts_dirs)
-    )
+    sample_paths = [
+        d / "samples.jsonl" for d in artifacts_dirs if (d / "samples.jsonl").exists()
+    ]
+    token_paths = [
+        d / "tokens.jsonl" for d in artifacts_dirs if (d / "tokens.jsonl").exists()
+    ]
+    if not sample_paths:
+        raise SystemExit(f"No samples.jsonl found under {multirun_dir}")
+
+    sample_logprobs = merge(*(load_sample_logprobs(p) for p in sample_paths))
     sample_probabilities = to_probabilities(sample_logprobs)
-    token_probabilities = to_probabilities(token_logprobs)
 
     plot_mean_std_box(
         sample_probabilities,
@@ -59,6 +62,15 @@ def run(multirun_dir: Path, out: Path) -> None:
         xlabel="logprob_mean",
         out_path=out / "sample_logprob_density",
     )
+
+    # Token-level plots require tokens.jsonl (written only when
+    # save_token_logprobs is set); skip them cleanly when it's absent.
+    if not token_paths:
+        print(f"Wrote sample-level plots to {out} (no tokens.jsonl -> skipped token plots)")
+        return
+
+    token_logprobs = merge(*(load_token_logprobs(p) for p in token_paths))
+    token_probabilities = to_probabilities(token_logprobs)
     plot_mean_std_box(
         token_probabilities,
         title="Distribution of token probability by method",

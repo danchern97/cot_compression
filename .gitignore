@@ -27,6 +27,7 @@ data/**/train.npy
 data/**/val.npy
 data/**/tokenizer.json
 data/**/meta.json
+data/entropy_cache/cot_entropies__Qwen__Qwen3-4B.npz
 
 # OS/editor
 .DS_Store

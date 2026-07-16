@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-from omegaconf import OmegaConf
-
-from cot_compression.compression import (
-    RandomCompressionMethod,
-    build_compression_methods,
-    extend_tokenizer_and_model,
-)
 from cot_compression.data.answers import (
     extract_answer_trace,
     find_answer_span,
@@ -88,14 +81,6 @@ class FakeChatTokenizer:
             "attention_mask": [1 for _ in input_ids],
             "offset_mapping": offsets,
         }
-
-
-class FakeResizeModel:
-    def __init__(self) -> None:
-        self.resize_calls: list[tuple[int, bool]] = []
-
-    def resize_token_embeddings(self, size: int, mean_resizing: bool) -> None:
-        self.resize_calls.append((size, mean_resizing))
 
 
 def test_validate_messages_requires_assistant() -> None:
@@ -253,44 +238,3 @@ def test_find_answer_span_handles_template_normalized_think_tags() -> None:
     assert rendered[start:end] == "Answer"
 
 
-def test_random_method_is_deterministic_and_extends_vocab() -> None:
-    tokenizer = FakeChatTokenizer()
-    model = FakeResizeModel()
-    cfg = OmegaConf.create(
-        {
-            "evaluation": {
-                "methods": {
-                    "enabled": ["base", "random"],
-                    "random": {
-                        "abstract_vocab_size": 4,
-                        "abstract_length": 3,
-                        "patching": None,
-                        "isolate_cot_context": False,
-                    },
-                    "patching": {},
-                }
-            }
-        }
-    )
-    methods = build_compression_methods(cfg)
-    extend_tokenizer_and_model(tokenizer=tokenizer, model=model, methods=methods)
-
-    trace = extract_answer_trace(
-        [{"role": "assistant", "content": "<think>Trace</think>\nAnswer"}]
-    )
-    assert trace is not None
-    random_method = next(
-        method for method in methods if isinstance(method, RandomCompressionMethod)
-    )
-    first = random_method.transform(trace, sample_index=5, seed=13)
-    second = random_method.transform(trace, sample_index=5, seed=13)
-    third = random_method.transform(trace, sample_index=6, seed=13)
-    content = first[0]["content"]
-
-    assert first == second
-    assert first != third
-    assert content.startswith("<think>")
-    assert "</think>\nAnswer" in content
-    assert "Trace" not in content
-    assert len(tokenizer.added_tokens) == 4
-    assert model.resize_calls == [(104, False)]

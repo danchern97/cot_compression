@@ -21,6 +21,11 @@ class PatchingMethod:
         """Whether split() needs per-token entropies to decide boundaries."""
         return False
 
+    @property
+    def param_tag(self) -> str:
+        """Short provenance tag for the strategy's parameter (e.g. 'ps8')."""
+        return self.name
+
     def split(
         self,
         num_tokens: int,
@@ -42,6 +47,10 @@ class UniformPatchingMethod(PatchingMethod):
             raise ValueError("patch_size must be positive.")
         super().__init__(name="uniform")
         object.__setattr__(self, "patch_size", patch_size)
+
+    @property
+    def param_tag(self) -> str:
+        return f"ps{self.patch_size}"
 
     def split(
         self,
@@ -68,6 +77,10 @@ class RandomPatchingMethod(PatchingMethod):
             raise ValueError("max_exponent must be non-negative.")
         super().__init__(name="exponential")
         object.__setattr__(self, "max_exponent", max_exponent)
+
+    @property
+    def param_tag(self) -> str:
+        return f"exp{self.max_exponent}"
 
     def split(
         self,
@@ -106,6 +119,10 @@ class EntropyPatchingMethod(PatchingMethod):
             raise ValueError("percentile must be within [0, 100].")
         super().__init__(name="entropy")
         object.__setattr__(self, "percentile", percentile)
+
+    @property
+    def param_tag(self) -> str:
+        return f"p{self.percentile:g}"
 
     def requires_entropies(self) -> bool:
         return True

@@ -13,14 +13,19 @@ from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from cot_compression.compression import (
+    PLACEHOLDER_TOKEN,
     CompressionMethod,
-    EmbeddingCompressionMethod,
     build_compression_methods,
-    extend_tokenizer_and_model,
 )
 from cot_compression.data.answers import extract_answer_trace, tokenize_answer
 from cot_compression.data.chat import IGNORE_INDEX
 from cot_compression.data.dolci import load_dolci_sft_data
+from cot_compression.entropy import (
+    compute_cot_entropies,
+    entropy_cache_path,
+    load_entropy_cache,
+    save_entropies_npz,
+)
 from cot_compression.training.logging import RunLogger
 from cot_compression.training.sft import parse_torch_dtype
 from cot_compression.training.utils import (
@@ -41,6 +46,8 @@ class SampleScore:
     answer_tokens: int
     logprob_sum: float
     logprob_mean: float
+    compressed_cot_tokens: int | None
+    compression_ratio: float | None
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,9 @@ class TokenScore:
 @dataclass(frozen=True)
 class MethodSummary:
     method: str
+    method_family: str
+    patching: str
+    patching_param: str
     samples: int
     skipped: int
     mean_logprob: float
@@ -62,6 +72,9 @@ class MethodSummary:
     sem_logprob: float
     mean_logprob_sum: float
     mean_answer_tokens: float
+    mean_compression_ratio: float
+    std_compression_ratio: float
+    mean_compressed_cot_tokens: float
 
 
 @dataclass(frozen=True)
@@ -72,6 +85,8 @@ class PreparedSample:
     input_ids: list[int]
     attention_mask: list[int]
     labels: list[int]
+    compressed_cot_tokens: int | None
+    compression_ratio: float | None
     slot_positions: list[int] = field(default_factory=list)
     slot_embeddings: torch.Tensor | None = None
 
@@ -137,11 +152,17 @@ def _pad_batch(
     )
 
 
+# Per-row: (answer logprob sum, [(token_index, token_id, logprob), ...],
+# answer-token entropies or None).
+RowResult = tuple[float, list[tuple[int, int, float]], torch.Tensor | None]
+
+
 def _answer_logprobs_from_logits(
     logits: torch.Tensor,
     label_tensor: torch.Tensor,
     device: torch.device,
-) -> list[tuple[float, list[tuple[int, int, float]]]]:
+    save_entropies: bool,
+) -> list[RowResult]:
     logits = logits[:, :-1, :]
     shifted_labels = label_tensor[:, 1:]
     shifted_positions = torch.arange(1, label_tensor.size(1), device=device)
@@ -152,7 +173,7 @@ def _answer_logprobs_from_logits(
         reduction="none",
     ).view_as(shifted_labels)
 
-    results = []
+    results: list[RowResult] = []
     expanded_positions = shifted_positions.expand_as(shifted_labels)
     for row_index in range(shifted_labels.size(0)):
         row_labels = shifted_labels[row_index]
@@ -172,54 +193,74 @@ def _answer_logprobs_from_logits(
                 strict=True,
             )
         ]
-        results.append((float(logprob_values.sum().item()), token_logprobs))
+        answer_entropy = None
+        if save_entropies:
+            # Gather answer-position logits first, then softmax only those, to
+            # avoid materializing a [seq, vocab] distribution over the full row.
+            answer_logits = logits[row_index][row_mask]
+            log_probs = F.log_softmax(answer_logits.float(), dim=-1)
+            answer_entropy = -(log_probs.exp() * log_probs).sum(dim=-1).cpu()
+        results.append((float(logprob_values.sum().item()), token_logprobs, answer_entropy))
     return results
 
 
-def compute_batch_answer_logprobs(
+def score_batch_logprobs(
     model: torch.nn.Module,
     batch: list[PreparedSample],
     pad_token_id: int,
     device: torch.device,
-) -> list[tuple[float, list[tuple[int, int, float]]]]:
-    input_tensor, attention_tensor, label_tensor = _pad_batch(batch, pad_token_id, device)
-    with torch.no_grad():
-        outputs = model(input_ids=input_tensor, attention_mask=attention_tensor)
-    return _answer_logprobs_from_logits(outputs.logits, label_tensor, device)
+    save_entropies: bool,
+) -> list[RowResult]:
+    """Answer log-probs for a batch, splicing slot embeddings when present.
 
-
-def compute_batch_answer_logprobs_from_embeds(
-    model: torch.nn.Module,
-    batch: list[PreparedSample],
-    pad_token_id: int,
-    device: torch.device,
-) -> list[tuple[float, list[tuple[int, int, float]]]]:
+    A batch is homogeneous (all samples come from the same method), so either
+    all carry slot embeddings (embedding-splice path) or none do (text path).
+    """
     input_tensor, attention_tensor, label_tensor = _pad_batch(batch, pad_token_id, device)
+    uses_slots = batch[0].slot_embeddings is not None
     with torch.no_grad():
-        embeds = cast(Any, model).get_input_embeddings()(input_tensor)
-        for row_index, sample in enumerate(batch):
-            assert sample.slot_embeddings is not None
-            for position, vector in zip(
-                sample.slot_positions, sample.slot_embeddings, strict=True
-            ):
-                embeds[row_index, position] = vector.to(
-                    device=embeds.device, dtype=embeds.dtype
-                )
-        outputs = model(inputs_embeds=embeds, attention_mask=attention_tensor)
-    return _answer_logprobs_from_logits(outputs.logits, label_tensor, device)
+        if uses_slots:
+            embeds = cast(Any, model).get_input_embeddings()(input_tensor)
+            for row_index, sample in enumerate(batch):
+                assert sample.slot_embeddings is not None
+                for position, vector in zip(
+                    sample.slot_positions, sample.slot_embeddings, strict=True
+                ):
+                    embeds[row_index, position] = vector.to(
+                        device=embeds.device, dtype=embeds.dtype
+                    )
+            outputs = model(inputs_embeds=embeds, attention_mask=attention_tensor)
+        else:
+            outputs = model(input_ids=input_tensor, attention_mask=attention_tensor)
+    return _answer_logprobs_from_logits(
+        outputs.logits, label_tensor, device, save_entropies
+    )
 
 
 def summarize_method(
-    method: str,
+    method: CompressionMethod,
     samples: list[SampleScore],
     skipped: int,
 ) -> MethodSummary:
     logprobs = [sample.logprob_mean for sample in samples]
     summed_logprobs = [sample.logprob_sum for sample in samples]
     token_counts = [sample.answer_tokens for sample in samples]
+    ratios = [
+        sample.compression_ratio
+        for sample in samples
+        if sample.compression_ratio is not None
+    ]
+    compressed = [
+        sample.compressed_cot_tokens
+        for sample in samples
+        if sample.compressed_cot_tokens is not None
+    ]
     std = statistics.stdev(logprobs) if len(logprobs) > 1 else 0.0
     return MethodSummary(
-        method=method,
+        method=method.name,
+        method_family=method.method_family,
+        patching=method.patching_name,
+        patching_param=method.patching_param,
         samples=len(samples),
         skipped=skipped,
         mean_logprob=sum(logprobs) / len(logprobs) if logprobs else float("nan"),
@@ -231,6 +272,11 @@ def summarize_method(
         mean_answer_tokens=sum(token_counts) / len(token_counts)
         if token_counts
         else float("nan"),
+        mean_compression_ratio=sum(ratios) / len(ratios) if ratios else float("nan"),
+        std_compression_ratio=statistics.stdev(ratios) if len(ratios) > 1 else 0.0,
+        mean_compressed_cot_tokens=sum(compressed) / len(compressed)
+        if compressed
+        else float("nan"),
     )
 
 
@@ -240,6 +286,44 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(row) + "\n")
 
 
+def _load_cot_entropies(
+    method: CompressionMethod,
+    dataset: Any,
+    model: torch.nn.Module,
+    tokenizer: Any,
+    cfg: DictConfig,
+    device: torch.device,
+    sample_indices: range,
+) -> dict[int, torch.Tensor]:
+    """CoT entropies for the samples this method needs, from cache or inline.
+
+    Loads the shared cache when configured, then batch-computes any missing
+    samples on the clean model so a config always has what it needs.
+    """
+    if not method.needs_entropies():
+        return {}
+    entropies: dict[int, torch.Tensor] = {}
+    cache_dir = cfg.evaluation.entropy_cache_dir
+    if cache_dir is not None:
+        path = entropy_cache_path(Path(str(cache_dir)), str(cfg.method.model_name))
+        if path.exists():
+            entropies = load_entropy_cache(path)
+    missing = [index for index in sample_indices if index not in entropies]
+    if missing:
+        entropies.update(
+            compute_cot_entropies(
+                model=model,
+                tokenizer=tokenizer,
+                examples=dataset,
+                sample_indices=missing,
+                batch_size=int(cfg.evaluation.batch_size),
+                max_batch_tokens=optional_int(cfg.evaluation.max_batch_tokens),
+                device=device,
+            )
+        )
+    return entropies
+
+
 def evaluate_method(
     method: CompressionMethod,
     dataset: Any,
@@ -247,52 +331,55 @@ def evaluate_method(
     tokenizer: Any,
     cfg: DictConfig,
     device: torch.device,
-) -> tuple[MethodSummary, list[SampleScore], list[TokenScore]]:
-    samples = []
-    token_rows = []
+) -> tuple[MethodSummary, list[SampleScore], list[TokenScore], dict[int, torch.Tensor]]:
+    samples: list[SampleScore] = []
+    token_rows: list[TokenScore] = []
+    answer_entropies: dict[int, torch.Tensor] = {}
     skipped = 0
     max_examples = cfg.evaluation.max_examples
     limit = (
         len(dataset) if max_examples is None else min(len(dataset), int(max_examples))
     )
+    indices = range(limit)
     max_length = optional_int(cfg.evaluation.max_length)
     batch_size = int(cfg.evaluation.batch_size)
     max_batch_tokens = optional_int(cfg.evaluation.max_batch_tokens)
+    seed = int(cfg.evaluation.seed)
+    save_entropies = bool(cfg.evaluation.save_entropies)
+    save_token_logprobs = bool(cfg.evaluation.save_token_logprobs)
     pad_token_id = int(tokenizer.pad_token_id)
+    placeholder_id = tokenizer.convert_tokens_to_ids(PLACEHOLDER_TOKEN)
+    unk_id = tokenizer.unk_token_id
 
-    score_fn = (
-        compute_batch_answer_logprobs_from_embeds
-        if method.requires_model_embeddings()
-        else compute_batch_answer_logprobs
+    cot_entropies = _load_cot_entropies(
+        method, dataset, model, tokenizer, cfg, device, indices
     )
 
     def score_batch(batch: list[PreparedSample]) -> None:
         if not batch:
             return
-        batch_results = score_fn(
-            model=model,
-            batch=batch,
-            pad_token_id=pad_token_id,
-            device=device,
-        )
-        for prepared, (logprob_sum, token_logprobs) in zip(
+        for prepared, (logprob_sum, token_logprobs, answer_entropy) in zip(
             batch,
-            batch_results,
+            score_batch_logprobs(
+                model, batch, pad_token_id, device, save_entropies
+            ),
             strict=True,
         ):
             answer_tokens = len(token_logprobs)
-            sample = SampleScore(
-                method=method.name,
-                sample_index=prepared.sample_index,
-                sample_id=prepared.sample_id,
-                dataset_source=prepared.dataset_source,
-                answer_tokens=answer_tokens,
-                logprob_sum=logprob_sum,
-                logprob_mean=logprob_sum / answer_tokens,
+            samples.append(
+                SampleScore(
+                    method=method.name,
+                    sample_index=prepared.sample_index,
+                    sample_id=prepared.sample_id,
+                    dataset_source=prepared.dataset_source,
+                    answer_tokens=answer_tokens,
+                    logprob_sum=logprob_sum,
+                    logprob_mean=logprob_sum / answer_tokens,
+                    compressed_cot_tokens=prepared.compressed_cot_tokens,
+                    compression_ratio=prepared.compression_ratio,
+                )
             )
-            samples.append(sample)
-
-            if bool(cfg.evaluation.save_token_logprobs):
+            if save_token_logprobs:
                 token_rows.extend(
                     TokenScore(
                         method=method.name,
@@ -303,40 +390,34 @@ def evaluate_method(
                     )
                     for token_index, token_id, logprob in token_logprobs
                 )
+            if answer_entropy is not None:
+                answer_entropies[prepared.sample_index] = answer_entropy
 
-    batch = []
-    for sample_index in range(limit):
+    batch: list[PreparedSample] = []
+    for sample_index in indices:
         example = dataset[sample_index]
         trace = extract_answer_trace(example["messages"])
         if trace is None:
             skipped += 1
             continue
 
-        slot_embeddings = None
-        if method.requires_model_embeddings():
-            embedded = cast(EmbeddingCompressionMethod, method).prepare(
+        try:
+            result = method.compress(
                 trace=trace,
+                sample_index=sample_index,
+                seed=seed,
                 tokenizer=tokenizer,
                 model=model,
                 device=device,
-                sample_index=sample_index,
-                seed=int(cfg.evaluation.seed),
+                cot_entropy=cot_entropies.get(sample_index),
             )
-            messages = embedded.messages
-            slot_embeddings = embedded.slot_embeddings
-        else:
-            messages = method.transform(
-                trace=trace,
-                sample_index=sample_index,
-                seed=int(cfg.evaluation.seed),
-                tokenizer=tokenizer,
-                model=model,
-                device=device,
-            )
+        except ValueError:
+            skipped += 1
+            continue
 
         tokenized = tokenize_answer(
             tokenizer=tokenizer,
-            messages=messages,
+            messages=result.messages,
             answer=trace.answer,
             max_length=max_length,
         )
@@ -345,20 +426,26 @@ def evaluate_method(
             continue
 
         slot_positions: list[int] = []
-        if slot_embeddings is not None:
-            slot_token_id = tokenizer.convert_tokens_to_ids(
-                cast(EmbeddingCompressionMethod, method).slot_token
-            )
+        if result.slot_embeddings is not None:
+            if placeholder_id is None or placeholder_id == unk_id:
+                raise ValueError(
+                    f"Tokenizer has no usable placeholder token {PLACEHOLDER_TOKEN!r}."
+                )
             slot_positions = [
                 position
                 for position, token_id in enumerate(tokenized.input_ids)
-                if token_id == slot_token_id
+                if token_id == placeholder_id
             ]
-            if len(slot_positions) != slot_embeddings.size(0):
+            if len(slot_positions) != result.slot_embeddings.size(0):
                 # Truncation by max_length cut off some placeholder slots.
                 skipped += 1
                 continue
 
+        ratio = (
+            result.compressed_cot_tokens / result.original_cot_tokens
+            if result.original_cot_tokens
+            else None
+        )
         prepared = PreparedSample(
             sample_index=sample_index,
             sample_id=example.get("id"),
@@ -366,8 +453,10 @@ def evaluate_method(
             input_ids=tokenized.input_ids,
             attention_mask=tokenized.attention_mask,
             labels=tokenized.labels,
+            compressed_cot_tokens=result.compressed_cot_tokens,
+            compression_ratio=ratio,
             slot_positions=slot_positions,
-            slot_embeddings=slot_embeddings,
+            slot_embeddings=result.slot_embeddings,
         )
         if batch_would_exceed_limit(batch, prepared, max_batch_tokens):
             score_batch(batch)
@@ -379,7 +468,7 @@ def evaluate_method(
 
     score_batch(batch)
 
-    return summarize_method(method.name, samples, skipped), samples, token_rows
+    return summarize_method(method, samples, skipped), samples, token_rows, answer_entropies
 
 
 def evaluate_methods(cfg: DictConfig) -> Path:
@@ -398,13 +487,13 @@ def evaluate_methods(cfg: DictConfig) -> Path:
         summaries = []
         sample_rows = []
         token_rows = []
+        # Per method, so different methods' answer entropies never collide on
+        # the same sample_index (one npz file per method).
+        answer_entropies_by_method: dict[str, dict[int, torch.Tensor]] = {}
         for method in methods:
             logger.info(f"Evaluating method: {method.name}")
             model, tokenizer = build_eval_model_and_tokenizer(cfg, device)
-            extend_tokenizer_and_model(
-                tokenizer=tokenizer, model=model, methods=[method]
-            )
-            summary, samples, tokens = evaluate_method(
+            summary, samples, tokens, entropies = evaluate_method(
                 method=method,
                 dataset=dataset,
                 model=model,
@@ -415,10 +504,12 @@ def evaluate_methods(cfg: DictConfig) -> Path:
             summaries.append(summary)
             sample_rows.extend(samples)
             token_rows.extend(tokens)
+            if entropies:
+                answer_entropies_by_method[method.name] = entropies
             logger.log_metrics(
                 {
                     f"{method.name}/mean_logprob": summary.mean_logprob,
-                    f"{method.name}/std_logprob": summary.std_logprob,
+                    f"{method.name}/mean_compression_ratio": summary.mean_compression_ratio,
                     f"{method.name}/samples": float(summary.samples),
                     f"{method.name}/skipped": float(summary.skipped),
                 },
@@ -444,10 +535,16 @@ def evaluate_methods(cfg: DictConfig) -> Path:
             encoding="utf-8",
         )
         write_jsonl(samples_path, [asdict(sample) for sample in sample_rows])
+        # Logged (small) artifacts; large npz files are written to disk only.
         paths = [summary_path, samples_path]
         if bool(cfg.evaluation.save_token_logprobs):
             write_jsonl(tokens_path, [asdict(token) for token in token_rows])
             paths.append(tokens_path)
+        if bool(cfg.evaluation.save_entropies):
+            for name, entropies in answer_entropies_by_method.items():
+                save_entropies_npz(
+                    artifact_dir / f"answer_entropies__{name}.npz", entropies
+                )
 
         for path in paths:
             logger.log_artifact(path)

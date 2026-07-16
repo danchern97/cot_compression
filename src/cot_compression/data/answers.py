@@ -67,6 +67,43 @@ def replace_trace(trace: AnswerTrace, replacement: str) -> list[Message]:
     return messages
 
 
+def cot_token_ids(trace: AnswerTrace, tokenizer: Any) -> list[int]:
+    """Tokenize the raw ``<think>...</think>`` CoT trace (no special tokens)."""
+    cot_ids = tokenizer(trace.trace, add_special_tokens=False)["input_ids"]
+    if not cot_ids:
+        raise ValueError("CoT trace produced no tokens.")
+    return list(cot_ids)
+
+
+def prefix_token_ids(trace: AnswerTrace, tokenizer: Any) -> list[int]:
+    """Tokenize everything preceding the CoT trace in the rendered chat.
+
+    Used so an entropy forward pass can see the same prompt context the main
+    answer-logprob forward pass sees, instead of scoring the CoT in isolation.
+
+    Renders messages *before* the final assistant turn with
+    add_generation_prompt=True, rather than searching for trace.trace as a
+    substring of the fully-rendered chat: chat templates (e.g. Qwen3's) don't
+    just strip <think> blocks from earlier assistant turns, they can also
+    rewrite the whitespace inside the *final* turn's <think> block when
+    reconstructing it (e.g. collapsing blank lines), so the original literal
+    text may never appear in the rendered output at all. add_generation_prompt
+    renders exactly the "assistant is about to respond" boundary the template
+    defines, with no substring matching.
+    """
+    prefix_messages = trace.messages[: trace.assistant_index]
+    if not prefix_messages:
+        return []
+    prefix_text = tokenizer.apply_chat_template(
+        prefix_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    if not prefix_text:
+        return []
+    return list(tokenizer(prefix_text, add_special_tokens=False)["input_ids"])
+
+
 def find_answer_span(
     messages: list[Message], rendered: str, answer: str
 ) -> tuple[int, int]:

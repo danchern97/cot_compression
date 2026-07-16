@@ -8,15 +8,16 @@ max_examples: null
 metric: answer_logprob
 normalize_by_length: true
 save_token_logprobs: true
+# Directory holding the precomputed CoT-entropy cache (npz). Null => compute
+# inline on demand. Point it at a persistent path to reuse across a sweep.
+# CoT entropies are always conditioned on the full prompt (never isolated).
+entropy_cache_dir: null
+# Save per-config answer-token entropies (artifacts/answer_entropies.npz).
+save_entropies: false
 methods:
   enabled:
     - base
     - random
-  random:
-    abstract_vocab_size: 1024
-    abstract_length: 128
-    isolate_cot_context: false
-    patching: null
   patching:
     uniform:
       patch_size: 8
@@ -24,8 +25,9 @@ methods:
       max_exponent: 6
     entropy:
       percentile: 80.0
+  random:
+    patching: null
   simple_mean:
     patching: null
   entropy_weighted_mean:
-    isolate_cot_context: false
     patching: null

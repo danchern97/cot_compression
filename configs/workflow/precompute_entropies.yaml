@@ -3,23 +3,23 @@
 defaults:
   - /paths: default
   - /data: dolci_think_sft_7b_600k
-  - /method: qwen3/4b
+  - /method: qwen3/0_6b
   - /evaluation: answer_loss
   - /logging: wandb
   - _self_
 
-mode: evaluate_methods
+mode: precompute_entropies
 
 logging:
   project: qwen3-answer-loss
-  log_file_name: eval.log
+  log_file_name: precompute.log
   tags:
     - qwen3
     - dolci
-    - answer-loss
+    - entropy-cache
 
 hydra:
   run:
-    dir: ${paths.output_dir}/runs/eval/${data.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ${paths.output_dir}/runs/precompute/${data.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   job:
     chdir: true

@@ -10,12 +10,56 @@ from omegaconf import OmegaConf
 from torch import nn
 from torch.nn import functional as F
 
-from cot_compression.compression import RandomCompressionMethod
-from cot_compression.data.answers import extract_answer_trace
 from cot_compression.data.dolci import DolciSFTData
-from cot_compression.patching import UniformPatchingMethod
 from cot_compression.training.evaluate import evaluate_methods
 from cot_compression.training.sft import train_sft
+
+_PATCHING = {
+    "uniform": {"patch_size": 4},
+    "random": {"max_exponent": 6},
+    "entropy": {"percentile": 80.0},
+}
+
+
+def _eval_cfg(tmp_path, methods, **evaluation_overrides):
+    evaluation = {
+        "seed": 7,
+        "device": "cpu",
+        "torch_dtype": "float32",
+        "max_length": None,
+        "batch_size": 2,
+        "max_batch_tokens": 512,
+        "max_examples": None,
+        "metric": "answer_logprob",
+        "normalize_by_length": True,
+        "save_token_logprobs": True,
+        "entropy_cache_dir": None,
+        "save_entropies": False,
+        "methods": methods,
+    }
+    evaluation.update(evaluation_overrides)
+    return OmegaConf.create(
+        {
+            "paths": {"run_dir": str(tmp_path / "eval")},
+            "data": {"prepared_dir": str(tmp_path / "data")},
+            "method": {
+                "model_name": "tiny",
+                "trust_remote_code": False,
+                "use_fast_tokenizer": True,
+            },
+            "evaluation": evaluation,
+            "logging": {
+                "enabled": False,
+                "mode": "offline",
+                "project": "tests",
+                "entity": None,
+                "group": None,
+                "name": None,
+                "tags": [],
+                "log_file_name": "eval.log",
+            },
+        }
+    )
 
 
 class FakeSFTTokenizer:
@@ -23,10 +67,20 @@ class FakeSFTTokenizer:
 
     def __init__(self) -> None:
         self.pad_token_id = 0
+        self.unk_token_id = 1
         self.pad_token = "<pad>"
         self.truncation_side = "right"
-        self._token_to_id: dict[str, int] = {}
+        # Pre-registered special tokens (highest ids) so the regular/special
+        # boundary is 120; the placeholder is a real single token, no resize.
+        self._token_to_id: dict[str, int] = {
+            "<|vision_pad|>": 120,
+            "<think>": 121,
+            "</think>": 122,
+        }
         self._vocab_size = 128
+
+    def get_added_vocab(self) -> dict[str, int]:
+        return dict(self._token_to_id)
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
@@ -99,7 +153,7 @@ class FakeSFTTokenizer:
         Path(path, "tokenizer_config.json").write_text("{}", encoding="utf-8")
 
     def convert_tokens_to_ids(self, token: str) -> int:
-        return self._token_to_id[token]
+        return self._token_to_id.get(token, self.unk_token_id)
 
 
 class TinySFTModel(nn.Module):
@@ -261,48 +315,15 @@ def test_answer_loss_evaluation_smoke(monkeypatch, tmp_path) -> None:
         lambda cfg: DolciSFTData(train=examples, eval=examples, test=examples),
     )
 
-    cfg = OmegaConf.create(
+    cfg = _eval_cfg(
+        tmp_path,
         {
-            "paths": {"run_dir": str(tmp_path / "eval")},
-            "data": {"prepared_dir": str(tmp_path / "data")},
-            "method": {
-                "model_name": "tiny",
-                "trust_remote_code": False,
-                "use_fast_tokenizer": True,
-            },
-            "evaluation": {
-                "seed": 7,
-                "device": "cpu",
-                "torch_dtype": "float32",
-                "max_length": None,
-                "batch_size": 2,
-                "max_batch_tokens": 512,
-                "max_examples": None,
-                "metric": "answer_logprob",
-                "normalize_by_length": True,
-                "save_token_logprobs": True,
-                "methods": {
-                    "enabled": ["base", "random"],
-                    "random": {
-                        "abstract_vocab_size": 4,
-                        "abstract_length": 3,
-                        "patching": None,
-                        "isolate_cot_context": False,
-                    },
-                    "patching": {},
-                },
-            },
-            "logging": {
-                "enabled": False,
-                "mode": "offline",
-                "project": "tests",
-                "entity": None,
-                "group": None,
-                "name": None,
-                "tags": [],
-                "log_file_name": "eval.log",
-            },
-        }
+            "enabled": ["base", "random"],
+            "patching": _PATCHING,
+            "random": {"patching": "uniform"},
+            "simple_mean": {"patching": None},
+            "entropy_weighted_mean": {"patching": None},
+        },
     )
 
     summary_path = evaluate_methods(cfg)
@@ -320,17 +341,20 @@ def test_answer_loss_evaluation_smoke(monkeypatch, tmp_path) -> None:
         for line in tokens_path.read_text(encoding="utf-8").splitlines()
     ]
 
-    assert set(methods) == {"base", "random"}
+    assert set(methods) == {"base", "random_uniform_ps4"}
     assert summary["metric"] == "answer_logprob"
     assert methods["base"]["samples"] == 1
-    assert "mean_logprob" in methods["base"]
     assert methods["base"]["skipped"] == 1
-    assert methods["random"]["samples"] == 1
-    assert methods["random"]["skipped"] == 1
-    assert {row["method"] for row in sample_rows} == {"base", "random"}
+    assert methods["base"]["method_family"] == "base"
+    # base = full CoT, ratio 1.0; random compresses below 1.
+    assert methods["base"]["mean_compression_ratio"] == 1.0
+    assert methods["random_uniform_ps4"]["samples"] == 1
+    assert methods["random_uniform_ps4"]["skipped"] == 1
+    assert methods["random_uniform_ps4"]["mean_compression_ratio"] < 1.0
+    assert {row["method"] for row in sample_rows} == {"base", "random_uniform_ps4"}
     assert all(row["answer_tokens"] > 0 for row in sample_rows)
-    assert all("logprob_mean" in row for row in sample_rows)
-    assert {row["method"] for row in token_rows} == {"base", "random"}
+    assert all("compression_ratio" in row for row in sample_rows)
+    assert {row["method"] for row in token_rows} == {"base", "random_uniform_ps4"}
     assert all("logprob" in row for row in token_rows)
 
 
@@ -340,7 +364,7 @@ def test_answer_loss_evaluation_embedding_methods_smoke(monkeypatch, tmp_path) -
             {
                 "messages": [
                     {"role": "user", "content": "Question"},
-                    {"role": "assistant", "content": "<think>Trace</think> Answer"},
+                    {"role": "assistant", "content": "<think>Trace here</think> Answer"},
                 ],
                 "dataset_source": "valid",
                 "id": "ok",
@@ -361,59 +385,20 @@ def test_answer_loss_evaluation_embedding_methods_smoke(monkeypatch, tmp_path) -
         lambda cfg: DolciSFTData(train=examples, eval=examples, test=examples),
     )
 
-    cfg = OmegaConf.create(
+    # Exercise both directions of the needs-entropies OR: simple_mean's own
+    # reduction never needs entropies but its "entropy" patching does; the
+    # reverse for entropy_weighted_mean with "uniform" patching. Entropies are
+    # computed inline (no cache dir). save_entropies exercises the byproduct.
+    cfg = _eval_cfg(
+        tmp_path,
         {
-            "paths": {"run_dir": str(tmp_path / "eval")},
-            "data": {"prepared_dir": str(tmp_path / "data")},
-            "method": {
-                "model_name": "tiny",
-                "trust_remote_code": False,
-                "use_fast_tokenizer": True,
-            },
-            "evaluation": {
-                "seed": 7,
-                "device": "cpu",
-                "torch_dtype": "float32",
-                "max_length": None,
-                "batch_size": 2,
-                "max_batch_tokens": 512,
-                "max_examples": None,
-                "metric": "answer_logprob",
-                "normalize_by_length": True,
-                "save_token_logprobs": True,
-                "methods": {
-                    "enabled": ["simple_mean", "entropy_weighted_mean"],
-                    "random": {
-                        "abstract_vocab_size": 4,
-                        "abstract_length": 3,
-                    },
-                    "patching": {
-                        "uniform": {"patch_size": 4},
-                        "random": {"max_exponent": 6},
-                        "entropy": {"percentile": 80.0},
-                    },
-                    # Exercise both directions of the needs-entropies OR:
-                    # simple_mean's own reduction never needs entropies, but
-                    # its "entropy" patching strategy does; the reverse for
-                    # entropy_weighted_mean with "uniform" patching.
-                    "simple_mean": {"patching": "entropy"},
-                    "entropy_weighted_mean": {
-                        "isolate_cot_context": False,
-                        "patching": "uniform",
-                    },
-                },
-            },
-            "logging": {
-                "enabled": False,
-                "mode": "offline",
-                "project": "tests",
-                "entity": None,
-                "group": None,
-                "name": None,
-                "tags": [],
-                "log_file_name": "eval.log",
-            },
-        }
+            "enabled": ["simple_mean", "entropy_weighted_mean"],
+            "patching": _PATCHING,
+            "random": {"patching": None},
+            "simple_mean": {"patching": "entropy"},
+            "entropy_weighted_mean": {"patching": "uniform"},
+        },
+        save_entropies=True,
     )
 
     summary_path = evaluate_methods(cfg)
@@ -426,52 +411,20 @@ def test_answer_loss_evaluation_embedding_methods_smoke(monkeypatch, tmp_path) -
         for line in samples_path.read_text(encoding="utf-8").splitlines()
     ]
 
-    # patching gets folded into the method name so results from different
-    # patching strategies never collide when merged across sweep jobs.
-    assert set(methods) == {"simple_mean_entropy", "entropy_weighted_mean_uniform"}
-    assert methods["simple_mean_entropy"]["samples"] == 1
-    assert methods["entropy_weighted_mean_uniform"]["samples"] == 1
+    # patching (strategy + param) folds into the method name so results from
+    # different rates never collide when merged across sweep jobs.
+    assert set(methods) == {"simple_mean_entropy_p80", "entropy_weighted_mean_uniform_ps4"}
+    assert methods["simple_mean_entropy_p80"]["samples"] == 1
+    assert methods["entropy_weighted_mean_uniform_ps4"]["samples"] == 1
+    assert methods["simple_mean_entropy_p80"]["patching"] == "entropy"
     assert {row["method"] for row in sample_rows} == {
-        "simple_mean_entropy",
-        "entropy_weighted_mean_uniform",
+        "simple_mean_entropy_p80",
+        "entropy_weighted_mean_uniform_ps4",
     }
     assert all(row["answer_tokens"] > 0 for row in sample_rows)
-
-
-def test_random_compression_method_with_patching_emits_one_token_per_patch() -> None:
-    tokenizer = FakeSFTTokenizer()
-    model = TinySFTModel()
-    tokenizer.add_tokens(["<abs_00000>", "<abs_00001>", "<abs_00002>", "<abs_00003>"])
-    model.resize_token_embeddings(len(tokenizer))
-
-    trace = extract_answer_trace(
-        [
-            {"role": "user", "content": "Question"},
-            {"role": "assistant", "content": "<think>Trace</think> Answer"},
-        ]
-    )
-    assert trace is not None
-
-    method = RandomCompressionMethod(
-        abstract_vocab_size=4,
-        abstract_length=3,
-        patching=UniformPatchingMethod(patch_size=4),
-    )
-    assert method.name == "random_uniform"
-
-    messages = method.transform(
-        trace,
-        sample_index=0,
-        seed=1,
-        tokenizer=tokenizer,
-        model=model,
-        device=torch.device("cpu"),
-    )
-    content = messages[-1]["content"]
-
-    # "<think>Trace</think>" is 20 characters -> 20 tokens under
-    # FakeSFTTokenizer's one-char-per-token fallback; patch_size=4 -> 5
-    # patches -> exactly 5 replacement tokens (one per patch), not
-    # abstract_length (3) per patch and not one for the whole trace.
-    replacement = content[len("<think>") : content.index("</think>")]
-    assert len(replacement.split()) == 5
+    assert all(row["compression_ratio"] is not None for row in sample_rows)
+    # One answer-entropy artifact per method (no cross-method collision).
+    assert (summary_path.with_name("answer_entropies__simple_mean_entropy_p80.npz")).exists()
+    assert (
+        summary_path.with_name("answer_entropies__entropy_weighted_mean_uniform_ps4.npz")
+    ).exists()

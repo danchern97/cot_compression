@@ -1,0 +1,17 @@
+# Submitit/SLURM launcher for Snellius gpu_h100.
+# Use with multirun: python scripts/run.py -m hydra/launcher=snellius_h100 ...
+# The setup: block exports HF_HOME so every job reads/writes the HuggingFace
+# cache on /scratch-shared instead of the quota-limited home directory.
+defaults:
+  - submitit_slurm
+  - _self_
+
+partition: gpu_h100
+timeout_min: 1000
+cpus_per_task: 16
+gpus_per_node: 1
+tasks_per_node: 1
+nodes: 1
+array_parallelism: 256
+setup:
+  - export HF_HOME=/scratch-shared/$USER/huggingface
