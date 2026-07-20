@@ -19,15 +19,19 @@ methods:
     - base
     - random
   patching:
-    uniform:
-      patch_size: 8
+    # Target compression ratio (= original_len / compressed_len = average patch
+    # length, >= 1). Shared universal knob for uniform and every entropy-based
+    # strategy (entropy_threshold, entropy_diff, entropy_sum); each derives its
+    # own splitting constraint so the realized average patch length matches it.
+    compression_ratio: 2.0
     random:
       max_exponent: 6
-    entropy:
-      percentile: 80.0
   random:
     patching: null
   simple_mean:
     patching: null
   entropy_weighted_mean:
     patching: null
+    # softmax(ln H / T) pooling temperature: T=1 -> plain entropy-weighted mean,
+    # T=0 -> keep only the highest-entropy token per patch.
+    temperature: 1.0

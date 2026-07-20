@@ -14,7 +14,7 @@ from cot_compression.compression import (
 )
 from cot_compression.data.answers import cot_token_ids, extract_answer_trace
 from cot_compression.patching import (
-    EntropyPatchingMethod,
+    EntropyThresholdPatchingMethod,
     UniformPatchingMethod,
 )
 
@@ -53,7 +53,9 @@ class MiniTokenizer:
                 index += 1
         return {"input_ids": ids}
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+    def apply_chat_template(
+        self, messages, tokenize=False, add_generation_prompt=False
+    ):
         del tokenize, add_generation_prompt
         return "".join(f"<|{m['role']}|>\n{m['content']}\n" for m in messages)
 
@@ -69,7 +71,10 @@ class MiniModel(torch.nn.Module):
 
 def _trace(cot: str = "<think>aaaa bbbb cccc</think>", answer: str = "Ans"):
     trace = extract_answer_trace(
-        [{"role": "user", "content": "Q"}, {"role": "assistant", "content": f"{cot} {answer}"}]
+        [
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": f"{cot} {answer}"},
+        ]
     )
     assert trace is not None
     return trace
@@ -86,7 +91,7 @@ def test_uniform_token_counts_and_slot_shape() -> None:
     tokenizer, model = MiniTokenizer(), MiniModel()
     trace = _trace()
     t = len(cot_token_ids(trace, tokenizer))
-    method = SimpleMeanCompressionMethod(UniformPatchingMethod(patch_size=4))
+    method = SimpleMeanCompressionMethod(UniformPatchingMethod(compression_ratio=4))
     result = method.compress(trace, 0, 7, tokenizer, model, DEVICE, None)
 
     expected_patches = math.ceil(t / 4)
@@ -94,14 +99,17 @@ def test_uniform_token_counts_and_slot_shape() -> None:
     assert result.compressed_cot_tokens == expected_patches
     assert result.slot_embeddings.shape == (expected_patches, 8)
     # Placeholder replaced the CoT text; joined without spaces.
-    assert compression.PLACEHOLDER_TOKEN * expected_patches in result.messages[-1]["content"]
+    assert (
+        compression.PLACEHOLDER_TOKEN * expected_patches
+        in result.messages[-1]["content"]
+    )
     assert "aaaa" not in result.messages[-1]["content"]
 
 
 def test_random_is_deterministic_and_uses_regular_vocab() -> None:
     tokenizer, model = MiniTokenizer(), MiniModel()
     trace = _trace()
-    method = RandomCompressionMethod(UniformPatchingMethod(patch_size=4))
+    method = RandomCompressionMethod(UniformPatchingMethod(compression_ratio=4))
 
     first = method.compress(trace, 5, 13, tokenizer, model, DEVICE, None)
     second = method.compress(trace, 5, 13, tokenizer, model, DEVICE, None)
@@ -122,7 +130,9 @@ def test_entropy_methods_require_entropy() -> None:
     tokenizer, model = MiniTokenizer(), MiniModel()
     trace = _trace()
     # entropy_weighted_mean always needs entropies, even without entropy patching.
-    method = EntropyWeightedMeanCompressionMethod(UniformPatchingMethod(patch_size=4))
+    method = EntropyWeightedMeanCompressionMethod(
+        UniformPatchingMethod(compression_ratio=4)
+    )
     assert method.needs_entropies()
     with pytest.raises(ValueError):
         method.compress(trace, 0, 0, tokenizer, model, DEVICE, None)
@@ -134,7 +144,9 @@ def test_cache_fed_entropy_reproduces_spans_and_slots() -> None:
     t = len(cot_token_ids(trace, tokenizer))
     entropy = torch.linspace(0.1, 1.0, t)  # stand-in cached CoT entropies
 
-    method = EntropyWeightedMeanCompressionMethod(EntropyPatchingMethod(percentile=50.0))
+    method = EntropyWeightedMeanCompressionMethod(
+        EntropyThresholdPatchingMethod(compression_ratio=2.0)
+    )
     a = method.compress(trace, 0, 0, tokenizer, model, DEVICE, entropy.clone())
     b = method.compress(trace, 0, 0, tokenizer, model, DEVICE, entropy.clone())
 
@@ -144,10 +156,96 @@ def test_cache_fed_entropy_reproduces_spans_and_slots() -> None:
     assert a.compressed_cot_tokens > 1
 
 
+def test_entropy_sum_patching_with_zero_temperature_compress_path() -> None:
+    # End-to-end compress() over the new entropy_sum patching + T=0 pooling:
+    # spans partition the CoT, one slot per patch, and each slot is exactly the
+    # embedding of its patch's highest-entropy token (one-hot at T=0).
+    tokenizer, model = MiniTokenizer(), MiniModel()
+    trace = _trace()
+    cot_ids = cot_token_ids(trace, tokenizer)
+    t = len(cot_ids)
+    entropy = torch.linspace(0.1, 1.0, t)
+
+    from cot_compression.patching import EntropySumPatchingMethod
+
+    patching = EntropySumPatchingMethod(compression_ratio=2.0)
+    method = EntropyWeightedMeanCompressionMethod(patching, temperature=0.0)
+    result = method.compress(trace, 0, 0, tokenizer, model, DEVICE, entropy.clone())
+
+    spans = patching.split(t, 0, 0, entropy)
+    assert result.compressed_cot_tokens == len(spans)
+    assert result.slot_embeddings.shape == (len(spans), 8)
+    embeds = model.emb(torch.tensor(cot_ids))
+    for row, (start, end) in enumerate(spans):
+        argmax = start + int(entropy[start:end].argmax())
+        assert torch.allclose(result.slot_embeddings[row], embeds[argmax], atol=1e-6)
+
+
 def test_method_naming_encodes_patching_param() -> None:
-    assert SimpleMeanCompressionMethod(UniformPatchingMethod(8)).name == "simple_mean_uniform_ps8"
     assert (
-        EntropyWeightedMeanCompressionMethod(EntropyPatchingMethod(80.0)).name
-        == "entropy_weighted_mean_entropy_p80"
+        SimpleMeanCompressionMethod(UniformPatchingMethod(8)).name
+        == "simple_mean_uniform_cr8"
+    )
+    assert (
+        EntropyWeightedMeanCompressionMethod(EntropyThresholdPatchingMethod(2.0)).name
+        == "entropy_weighted_mean_t1_entropy_threshold_cr2"
     )
     assert RandomCompressionMethod().name == "random"
+
+
+def test_method_naming_encodes_temperature() -> None:
+    # Distinct temperatures must yield distinct method names so sweep cells that
+    # share a (family, patching, ratio) do not collapse in aggregation.
+    patching = EntropyThresholdPatchingMethod(4.0)
+    names = {
+        EntropyWeightedMeanCompressionMethod(patching, temperature=t).name
+        for t in (0.0, 0.5, 1.0)
+    }
+    assert names == {
+        "entropy_weighted_mean_t0_entropy_threshold_cr4",
+        "entropy_weighted_mean_t0.5_entropy_threshold_cr4",
+        "entropy_weighted_mean_t1_entropy_threshold_cr4",
+    }
+    method = EntropyWeightedMeanCompressionMethod(patching, temperature=0.5)
+    assert method.compression_param == "t0.5"
+
+
+def _weighted_reduce(entropy_rows: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Run reduce_patches on a single patch of one-dimensional embeddings.
+
+    Embeds are set to the identity so the pooled output reads back the weights
+    (up to the variance rescale), letting us assert the weighting directly.
+    """
+    num_tokens = entropy_rows.shape[1]
+    embeds = torch.eye(num_tokens).unsqueeze(0)  # [1, n, n]
+    method = EntropyWeightedMeanCompressionMethod(temperature=temperature)
+    return method.reduce_patches(embeds, entropy_rows)[0]
+
+
+def test_temperature_one_matches_plain_entropy_weighting() -> None:
+    entropy = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    pooled = _weighted_reduce(entropy, temperature=1.0)
+    weights = entropy[0] / entropy[0].sum()
+    expected = weights / weights.pow(2).sum().sqrt()
+    assert torch.allclose(pooled, expected, atol=1e-6)
+
+
+def test_temperature_zero_keeps_only_highest_entropy_token() -> None:
+    entropy = torch.tensor([[1.0, 2.0, 9.0, 3.0]])
+    pooled = _weighted_reduce(entropy, temperature=0.0)
+    # One-hot on argmax (index 2); variance rescale by sqrt(sum w^2)=1 is a no-op.
+    expected = torch.tensor([0.0, 0.0, 1.0, 0.0])
+    assert torch.allclose(pooled, expected, atol=1e-6)
+
+
+def test_temperature_between_is_sharper_than_mean_weighting() -> None:
+    # Lower T concentrates more weight on the highest-entropy token than T=1.
+    entropy = torch.tensor([[1.0, 2.0, 9.0, 3.0]])
+    w_half = _weighted_reduce(entropy, temperature=0.5)
+    w_one = _weighted_reduce(entropy, temperature=1.0)
+    assert w_half[2] > w_one[2]
+
+
+def test_negative_temperature_rejected() -> None:
+    with pytest.raises(ValueError):
+        EntropyWeightedMeanCompressionMethod(temperature=-1.0)

@@ -38,19 +38,28 @@ class PatchingMethod:
 
 @dataclass(frozen=True)
 class UniformPatchingMethod(PatchingMethod):
-    """Fixed-size contiguous chunks; the last chunk may be shorter."""
+    """Fixed-size contiguous chunks; the last chunk may be shorter.
 
+    Parameterized by ``compression_ratio`` (= original_len / compressed_len =
+    average patch length), the same universal knob the entropy strategies use.
+    For uniform chunks the average patch length *is* the chunk size, so the
+    patch size is simply ``round(compression_ratio)``. Consequence: uniform can
+    only realize integer ratios (1.5 rounds to 2).
+    """
+
+    compression_ratio: float
     patch_size: int
 
-    def __init__(self, patch_size: int = 8) -> None:
-        if patch_size <= 0:
-            raise ValueError("patch_size must be positive.")
+    def __init__(self, compression_ratio: float = 8.0) -> None:
+        if compression_ratio < 1.0:
+            raise ValueError("compression_ratio must be >= 1.")
         super().__init__(name="uniform")
-        object.__setattr__(self, "patch_size", patch_size)
+        object.__setattr__(self, "compression_ratio", float(compression_ratio))
+        object.__setattr__(self, "patch_size", max(1, round(compression_ratio)))
 
     @property
     def param_tag(self) -> str:
-        return f"ps{self.patch_size}"
+        return f"cr{self.compression_ratio:g}"
 
     def split(
         self,
@@ -103,29 +112,46 @@ class RandomPatchingMethod(PatchingMethod):
 
 @dataclass(frozen=True)
 class EntropyPatchingMethod(PatchingMethod):
-    """Starts a new patch immediately before every token whose entropy is
-    at or above the Nth percentile of this trace's token entropies.
+    """Abstract base for entropy-driven patching strategies.
 
-    E.g. entropies [high, low, low, high, low] with percentile chosen so
-    only positions 0 and 3 clear the threshold split into
-    [high, low, low] and [high, low]: a high-entropy token always begins a
-    new patch, it's never grouped with what preceded it.
+    All entropy strategies are parameterized by a single universal knob,
+    ``compression_ratio`` (= original_len / compressed_len = target average
+    patch length, >= 1), and derive their per-trace splitting constraint
+    (percentile threshold, monotonic-difference threshold, or information
+    budget) so that the *realized* average patch length matches the target in
+    expectation. Subclasses implement ``split``.
     """
 
-    percentile: float
+    compression_ratio: float
 
-    def __init__(self, percentile: float = 80.0) -> None:
-        if not 0.0 <= percentile <= 100.0:
-            raise ValueError("percentile must be within [0, 100].")
-        super().__init__(name="entropy")
-        object.__setattr__(self, "percentile", percentile)
+    def __init__(self, compression_ratio: float, name: str) -> None:
+        if compression_ratio < 1.0:
+            raise ValueError("compression_ratio must be >= 1.")
+        super().__init__(name=name)
+        object.__setattr__(self, "compression_ratio", float(compression_ratio))
 
     @property
     def param_tag(self) -> str:
-        return f"p{self.percentile:g}"
+        return f"cr{self.compression_ratio:g}"
 
     def requires_entropies(self) -> bool:
         return True
+
+
+@dataclass(frozen=True)
+class EntropyThresholdPatchingMethod(EntropyPatchingMethod):
+    """Global-constraint patching: start a new patch immediately before every
+    token whose entropy is at or above the ``1 - 1/compression_ratio`` quantile
+    of this trace's token entropies.
+
+    A high-entropy token always begins a new patch, never grouped with what
+    preceded it. Roughly a ``1/compression_ratio`` fraction of tokens clear the
+    threshold, so the trace splits into ~L/compression_ratio patches, i.e. an
+    average patch length ~= compression_ratio.
+    """
+
+    def __init__(self, compression_ratio: float = 2.0) -> None:
+        super().__init__(compression_ratio, name="entropy_threshold")
 
     def split(
         self,
@@ -137,10 +163,97 @@ class EntropyPatchingMethod(PatchingMethod):
         del sample_index, seed
         assert entropies is not None
         # torch.quantile does not support bfloat16 (the model's usual dtype).
-        threshold = torch.quantile(entropies.float(), self.percentile / 100.0)
-        boundaries = (
-            [0]
-            + [i for i in range(1, num_tokens) if entropies[i] >= threshold]
-            + [num_tokens]
-        )
+        quantile = 1.0 - 1.0 / self.compression_ratio
+        threshold = torch.quantile(entropies[:num_tokens].float(), quantile)
+        # Compare on device and move the boundary indices across in a single
+        # transfer. Testing `entropies[i] >= threshold` inside a Python loop
+        # instead costs one host-device sync per CoT token (~10k per sample),
+        # which dominated evaluation runtime for entropy patching.
+        starts = (entropies[1:num_tokens] >= threshold).nonzero(as_tuple=True)[0]
+        boundaries = [0] + (starts + 1).tolist() + [num_tokens]
+        return list(zip(boundaries[:-1], boundaries[1:], strict=True))
+
+
+@dataclass(frozen=True)
+class EntropyDiffPatchingMethod(EntropyPatchingMethod):
+    """Approximate monotonic-constraint patching (BLT, arXiv:2412.09871).
+
+    Starts a new patch before token t when the entropy rises sharply from the
+    previous token, H(x_t) - H(x_{t-1}) > theta_r, with theta_r set to the
+    ``1 - 1/compression_ratio`` quantile of the consecutive entropy differences.
+    A ~1/compression_ratio fraction of positions clear theta_r, giving an
+    average patch length ~= compression_ratio.
+    """
+
+    def __init__(self, compression_ratio: float = 2.0) -> None:
+        super().__init__(compression_ratio, name="entropy_diff")
+
+    def split(
+        self,
+        num_tokens: int,
+        sample_index: int,
+        seed: int,
+        entropies: torch.Tensor | None,
+    ) -> list[tuple[int, int]]:
+        del sample_index, seed
+        assert entropies is not None
+        if num_tokens <= 1:
+            return [(0, num_tokens)]
+        entropy = entropies[:num_tokens].float()
+        diffs = entropy[1:] - entropy[:-1]  # diffs[i] = H[i+1] - H[i]
+        quantile = 1.0 - 1.0 / self.compression_ratio
+        theta_r = torch.quantile(diffs, quantile)
+        # A boundary before token i+1 when its entropy jumps past theta_r.
+        starts = (diffs > theta_r).nonzero(as_tuple=True)[0]
+        boundaries = [0] + (starts + 1).tolist() + [num_tokens]
+        return list(zip(boundaries[:-1], boundaries[1:], strict=True))
+
+
+@dataclass(frozen=True)
+class EntropySumPatchingMethod(EntropyPatchingMethod):
+    """Equal-information (B-budget) patching: cut whenever the cumulative token
+    entropy since the last cut passes an information budget B.
+
+    B is chosen from the target ratio as B = total_entropy * compression_ratio
+    / num_tokens, so the trace splits into ~round(num_tokens / compression_ratio)
+    patches of roughly equal summed entropy, giving an average patch length
+    ~= compression_ratio. Implemented via a vectorized cumulative-sum +
+    searchsorted (equivalent to the sequential "sum exceeds B" greedy) to avoid
+    a Python loop over tokens.
+    """
+
+    def __init__(self, compression_ratio: float = 2.0) -> None:
+        super().__init__(compression_ratio, name="entropy_sum")
+
+    def split(
+        self,
+        num_tokens: int,
+        sample_index: int,
+        seed: int,
+        entropies: torch.Tensor | None,
+    ) -> list[tuple[int, int]]:
+        del sample_index, seed
+        assert entropies is not None
+        if num_tokens <= 1:
+            return [(0, num_tokens)]
+        cum = torch.cumsum(entropies[:num_tokens].float(), dim=0)
+        total = cum[-1]
+        # Degenerate all-zero-entropy trace: fall back to uniform chunks so we
+        # still hit the target ratio instead of returning one giant patch.
+        if float(total) <= 0.0:
+            size = max(1, round(self.compression_ratio))
+            return [
+                (start, min(start + size, num_tokens))
+                for start in range(0, num_tokens, size)
+            ]
+        budget = total * self.compression_ratio / num_tokens
+        num_patches = max(1, int(round(float(total / budget))))
+        if num_patches <= 1:
+            return [(0, num_tokens)]
+        # Interior cut budgets k*B; the first token whose running sum exceeds
+        # each budget starts a new patch. right=True => first index with cum > t.
+        targets = budget * torch.arange(1, num_patches, device=cum.device)
+        raw = torch.searchsorted(cum, targets, right=True)
+        starts = torch.unique(raw.clamp(1, num_tokens - 1))
+        boundaries = [0] + starts.tolist() + [num_tokens]
         return list(zip(boundaries[:-1], boundaries[1:], strict=True))

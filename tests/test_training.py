@@ -15,9 +15,8 @@ from cot_compression.training.evaluate import evaluate_methods
 from cot_compression.training.sft import train_sft
 
 _PATCHING = {
-    "uniform": {"patch_size": 4},
+    "compression_ratio": 4.0,
     "random": {"max_exponent": 6},
-    "entropy": {"percentile": 80.0},
 }
 
 
@@ -341,20 +340,20 @@ def test_answer_loss_evaluation_smoke(monkeypatch, tmp_path) -> None:
         for line in tokens_path.read_text(encoding="utf-8").splitlines()
     ]
 
-    assert set(methods) == {"base", "random_uniform_ps4"}
+    assert set(methods) == {"base", "random_uniform_cr4"}
     assert summary["metric"] == "answer_logprob"
     assert methods["base"]["samples"] == 1
     assert methods["base"]["skipped"] == 1
     assert methods["base"]["method_family"] == "base"
     # base = full CoT, ratio 1.0; random compresses below 1.
     assert methods["base"]["mean_compression_ratio"] == 1.0
-    assert methods["random_uniform_ps4"]["samples"] == 1
-    assert methods["random_uniform_ps4"]["skipped"] == 1
-    assert methods["random_uniform_ps4"]["mean_compression_ratio"] < 1.0
-    assert {row["method"] for row in sample_rows} == {"base", "random_uniform_ps4"}
+    assert methods["random_uniform_cr4"]["samples"] == 1
+    assert methods["random_uniform_cr4"]["skipped"] == 1
+    assert methods["random_uniform_cr4"]["mean_compression_ratio"] < 1.0
+    assert {row["method"] for row in sample_rows} == {"base", "random_uniform_cr4"}
     assert all(row["answer_tokens"] > 0 for row in sample_rows)
     assert all("compression_ratio" in row for row in sample_rows)
-    assert {row["method"] for row in token_rows} == {"base", "random_uniform_ps4"}
+    assert {row["method"] for row in token_rows} == {"base", "random_uniform_cr4"}
     assert all("logprob" in row for row in token_rows)
 
 
@@ -395,7 +394,7 @@ def test_answer_loss_evaluation_embedding_methods_smoke(monkeypatch, tmp_path) -
             "enabled": ["simple_mean", "entropy_weighted_mean"],
             "patching": _PATCHING,
             "random": {"patching": None},
-            "simple_mean": {"patching": "entropy"},
+            "simple_mean": {"patching": "entropy_threshold"},
             "entropy_weighted_mean": {"patching": "uniform"},
         },
         save_entropies=True,
@@ -413,18 +412,18 @@ def test_answer_loss_evaluation_embedding_methods_smoke(monkeypatch, tmp_path) -
 
     # patching (strategy + param) folds into the method name so results from
     # different rates never collide when merged across sweep jobs.
-    assert set(methods) == {"simple_mean_entropy_p80", "entropy_weighted_mean_uniform_ps4"}
-    assert methods["simple_mean_entropy_p80"]["samples"] == 1
-    assert methods["entropy_weighted_mean_uniform_ps4"]["samples"] == 1
-    assert methods["simple_mean_entropy_p80"]["patching"] == "entropy"
+    assert set(methods) == {"simple_mean_entropy_threshold_cr4", "entropy_weighted_mean_t1_uniform_cr4"}
+    assert methods["simple_mean_entropy_threshold_cr4"]["samples"] == 1
+    assert methods["entropy_weighted_mean_t1_uniform_cr4"]["samples"] == 1
+    assert methods["simple_mean_entropy_threshold_cr4"]["patching"] == "entropy_threshold"
     assert {row["method"] for row in sample_rows} == {
-        "simple_mean_entropy_p80",
-        "entropy_weighted_mean_uniform_ps4",
+        "simple_mean_entropy_threshold_cr4",
+        "entropy_weighted_mean_t1_uniform_cr4",
     }
     assert all(row["answer_tokens"] > 0 for row in sample_rows)
     assert all(row["compression_ratio"] is not None for row in sample_rows)
     # One answer-entropy artifact per method (no cross-method collision).
-    assert (summary_path.with_name("answer_entropies__simple_mean_entropy_p80.npz")).exists()
+    assert (summary_path.with_name("answer_entropies__simple_mean_entropy_threshold_cr4.npz")).exists()
     assert (
-        summary_path.with_name("answer_entropies__entropy_weighted_mean_uniform_ps4.npz")
+        summary_path.with_name("answer_entropies__entropy_weighted_mean_t1_uniform_cr4.npz")
     ).exists()

@@ -33,3 +33,7 @@ data/entropy_cache/cot_entropies__Qwen__Qwen3-4B.npz
 .DS_Store
 .idea/
 .vscode/
+src/cot_compression/reporting/report_template.html
+EXPERIMENTS.md
+scripts/build_sweep_report.py
+scripts/run_entropy_sweep.sh
