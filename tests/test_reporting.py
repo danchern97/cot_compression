@@ -34,8 +34,12 @@ def test_plot_logprob_vs_compression(tmp_path) -> None:
         _summary("base", "base", "none", "none", 1.0, -1.0),
         _summary("random_uniform_ps8", "random", "uniform", "ps8", 0.12, -2.0),
         _summary("random_uniform_ps4", "random", "uniform", "ps4", 0.25, -1.8),
-        _summary("simple_mean_uniform_ps8", "simple_mean", "uniform", "ps8", 0.12, -1.5),
-        _summary("simple_mean_uniform_ps4", "simple_mean", "uniform", "ps4", 0.25, -1.3),
+        _summary(
+            "simple_mean_uniform_ps8", "simple_mean", "uniform", "ps8", 0.12, -1.5
+        ),
+        _summary(
+            "simple_mean_uniform_ps4", "simple_mean", "uniform", "ps4", 0.25, -1.3
+        ),
     ]
     out = tmp_path / "curve"
     plot_logprob_vs_compression(summaries, out)
@@ -50,13 +54,23 @@ def test_sample_scatter_and_loader(tmp_path) -> None:
     art.mkdir(parents=True)
     with (art / "samples.jsonl").open("w") as fh:
         for i in range(5):
-            fh.write(json.dumps({
-                "method": "entropy_weighted_mean_uniform_ps8",
-                "compression_ratio": 0.125,
-                "logprob_mean": -1.0 - i * 0.1,
-            }) + "\n")
+            fh.write(
+                json.dumps(
+                    {
+                        "method": "entropy_weighted_mean_uniform_ps8",
+                        "compression_ratio": 0.125,
+                        "logprob_mean": -1.0 - i * 0.1,
+                    }
+                )
+                + "\n"
+            )
         # a row missing compression_ratio must be skipped
-        fh.write(json.dumps({"method": "base", "compression_ratio": None, "logprob_mean": -1.0}) + "\n")
+        fh.write(
+            json.dumps(
+                {"method": "base", "compression_ratio": None, "logprob_mean": -1.0}
+            )
+            + "\n"
+        )
 
     by_method = load_sample_xy(tmp_path)
     assert set(by_method) == {"entropy_weighted_mean_uniform_ps8"}
@@ -71,7 +85,12 @@ def test_sample_scatter_and_loader(tmp_path) -> None:
 def test_load_summaries(tmp_path) -> None:
     for name, summary in [
         ("run1", _summary("base", "base", "none", "none", 1.0, -1.0)),
-        ("run2", _summary("simple_mean_uniform_ps8", "simple_mean", "uniform", "ps8", 0.1, -1.5)),
+        (
+            "run2",
+            _summary(
+                "simple_mean_uniform_ps8", "simple_mean", "uniform", "ps8", 0.1, -1.5
+            ),
+        ),
     ]:
         artifacts = tmp_path / name / "artifacts"
         artifacts.mkdir(parents=True)

@@ -236,5 +236,3 @@ def test_find_answer_span_handles_template_normalized_think_tags() -> None:
     start, end = find_answer_span(messages, rendered, "Answer")
 
     assert rendered[start:end] == "Answer"
-
-

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from datasets import Dataset
 from omegaconf import OmegaConf
@@ -11,7 +14,13 @@ from torch import nn
 from torch.nn import functional as F
 
 from cot_compression.data.dolci import DolciSFTData
-from cot_compression.training.evaluate import evaluate_methods
+from cot_compression.training.evaluate import (
+    SampleScore,
+    TokenLogprobWriter,
+    TokenScore,
+    evaluate_methods,
+    summarize_method,
+)
 from cot_compression.training.sft import train_sft
 
 _PATCHING = {
@@ -28,6 +37,8 @@ def _eval_cfg(tmp_path, methods, **evaluation_overrides):
         "max_length": None,
         "batch_size": 2,
         "max_batch_tokens": 512,
+        "num_workers": 0,
+        "prefetch_factor": 2,
         "max_examples": None,
         "metric": "answer_logprob",
         "normalize_by_length": True,
@@ -355,6 +366,25 @@ def test_answer_loss_evaluation_smoke(monkeypatch, tmp_path) -> None:
     assert all("compression_ratio" in row for row in sample_rows)
     assert {row["method"] for row in token_rows} == {"base", "random_uniform_cr4"}
     assert all("logprob" in row for row in token_rows)
+    # The writer runs on a background thread, so assert it neither drops nor
+    # duplicates rows: every scored answer token must appear exactly once.
+    assert len(token_rows) == sum(row["answer_tokens"] for row in sample_rows)
+    # reporting/sweep_stats.py derives answer-relative position from the running
+    # row count within each (method, sample_index) group, so groups must stay
+    # contiguous and ascending in token_index.
+    groups: list[tuple[str, int]] = []
+    for row in token_rows:
+        key = (row["method"], row["sample_index"])
+        if not groups or groups[-1] != key:
+            groups.append(key)
+    assert len(groups) == len(set(groups)), "a (method, sample) group was split up"
+    for key in groups:
+        indices = [
+            row["token_index"]
+            for row in token_rows
+            if (row["method"], row["sample_index"]) == key
+        ]
+        assert indices == sorted(indices)
 
 
 def test_answer_loss_evaluation_embedding_methods_smoke(monkeypatch, tmp_path) -> None:
@@ -363,7 +393,10 @@ def test_answer_loss_evaluation_embedding_methods_smoke(monkeypatch, tmp_path) -
             {
                 "messages": [
                     {"role": "user", "content": "Question"},
-                    {"role": "assistant", "content": "<think>Trace here</think> Answer"},
+                    {
+                        "role": "assistant",
+                        "content": "<think>Trace here</think> Answer",
+                    },
                 ],
                 "dataset_source": "valid",
                 "id": "ok",
@@ -412,10 +445,15 @@ def test_answer_loss_evaluation_embedding_methods_smoke(monkeypatch, tmp_path) -
 
     # patching (strategy + param) folds into the method name so results from
     # different rates never collide when merged across sweep jobs.
-    assert set(methods) == {"simple_mean_entropy_threshold_cr4", "entropy_weighted_mean_t1_uniform_cr4"}
+    assert set(methods) == {
+        "simple_mean_entropy_threshold_cr4",
+        "entropy_weighted_mean_t1_uniform_cr4",
+    }
     assert methods["simple_mean_entropy_threshold_cr4"]["samples"] == 1
     assert methods["entropy_weighted_mean_t1_uniform_cr4"]["samples"] == 1
-    assert methods["simple_mean_entropy_threshold_cr4"]["patching"] == "entropy_threshold"
+    assert (
+        methods["simple_mean_entropy_threshold_cr4"]["patching"] == "entropy_threshold"
+    )
     assert {row["method"] for row in sample_rows} == {
         "simple_mean_entropy_threshold_cr4",
         "entropy_weighted_mean_t1_uniform_cr4",
@@ -423,7 +461,332 @@ def test_answer_loss_evaluation_embedding_methods_smoke(monkeypatch, tmp_path) -
     assert all(row["answer_tokens"] > 0 for row in sample_rows)
     assert all(row["compression_ratio"] is not None for row in sample_rows)
     # One answer-entropy artifact per method (no cross-method collision).
-    assert (summary_path.with_name("answer_entropies__simple_mean_entropy_threshold_cr4.npz")).exists()
     assert (
-        summary_path.with_name("answer_entropies__entropy_weighted_mean_t1_uniform_cr4.npz")
+        summary_path.with_name(
+            "answer_entropies__simple_mean_entropy_threshold_cr4.npz"
+        )
     ).exists()
+    assert (
+        summary_path.with_name(
+            "answer_entropies__entropy_weighted_mean_t1_uniform_cr4.npz"
+        )
+    ).exists()
+
+
+def _run_eval_artifacts(monkeypatch, tmp_path, examples, num_workers):
+    monkeypatch.setattr(
+        "cot_compression.training.evaluate.AutoTokenizer", FakeSFTTokenizer
+    )
+    monkeypatch.setattr(
+        "cot_compression.training.evaluate.AutoModelForCausalLM", TinySFTModel
+    )
+    monkeypatch.setattr(
+        "cot_compression.training.evaluate.load_dolci_sft_data",
+        lambda cfg: DolciSFTData(train=examples, eval=examples, test=examples),
+    )
+    run_dir = tmp_path / f"workers_{num_workers}"
+    cfg = _eval_cfg(
+        run_dir,
+        {
+            # Covers every prep path: base (text), random (non-entropy patching),
+            # simple_mean (entropy patching -> span_counts), entropy_weighted_mean
+            # (uniform patching, entropy pooling in materialize).
+            "enabled": ["base", "random", "simple_mean", "entropy_weighted_mean"],
+            "patching": _PATCHING,
+            "random": {"patching": "uniform"},
+            "simple_mean": {"patching": "entropy_threshold"},
+            "entropy_weighted_mean": {"patching": "uniform"},
+        },
+        num_workers=num_workers,
+    )
+    summary_path = evaluate_methods(cfg)
+    return {
+        name: summary_path.with_name(name).read_text(encoding="utf-8")
+        for name in ("summary.json", "samples.jsonl", "tokens.jsonl")
+    }
+
+
+def test_answer_logprobs_from_logits_handles_bfloat16() -> None:
+    """The token-median histc and the sum-of-squares must work on bf16 logits
+    (the model's usual eval dtype) -- torch.histc has no bf16 kernel, so the
+    code casts to float32. Regression for a crash that only bf16 surfaced."""
+    from cot_compression.training.evaluate import _answer_logprobs_from_logits
+
+    torch.manual_seed(0)
+    logits = torch.randn(2, 6, 16, dtype=torch.bfloat16)
+    labels = torch.full((2, 6), -100)
+    labels[:, 3:] = torch.randint(0, 16, (2, 3))  # last 3 positions are "answer"
+    results, hist, under = _answer_logprobs_from_logits(
+        logits,
+        labels,
+        torch.device("cpu"),
+        save_entropies=False,
+        save_token_logprobs=True,
+    )
+    assert len(results) == 2
+    assert hist.shape[0] == 3000 and hist.sum() + under > 0
+    # sum-of-squares (5th field) is finite and non-negative for every row.
+    assert all(r[4] >= 0 and r[4] == r[4] for r in results)
+
+
+def _sample(mean_and_sumsq_tokens: list[float], index: int) -> SampleScore:
+    """A SampleScore whose answer tokens have the given per-token log-probs."""
+    return SampleScore(
+        method="m",
+        sample_index=index,
+        sample_id=None,
+        dataset_source=None,
+        answer_tokens=len(mean_and_sumsq_tokens),
+        logprob_sum=sum(mean_and_sumsq_tokens),
+        logprob_mean=sum(mean_and_sumsq_tokens) / len(mean_and_sumsq_tokens),
+        logprob_sumsq=sum(x * x for x in mean_and_sumsq_tokens),
+        compressed_cot_tokens=None,
+        compression_ratio=None,
+    )
+
+
+def test_summarize_method_token_and_sample_stats() -> None:
+    """Token stats pool every answer token; per-sample stats aggregate the sample
+    means. Means, medians and stds are all checked against a hand computation."""
+    method = SimpleNamespace(
+        name="m",
+        method_family="m",
+        patching_name="none",
+        patching_param="none",
+        compression_param="none",
+    )
+    # tokens per sample; pooled = [-1,-2,-0.5,-0.5,-1,-3] -> N=6, sum=-8, sumsq=15.5
+    token_lists = [[-1.0, -2.0], [-0.5, -0.5, -1.0], [-3.0]]
+    samples = [_sample(t, i) for i, t in enumerate(token_lists)]
+    pooled = [x for t in token_lists for x in t]
+    hist = torch.histc(torch.tensor(pooled), bins=3000, min=-30.0, max=0.0).numpy()
+    summary = summarize_method(
+        method, samples, skipped=0, token_hist=hist, token_under=0
+    )
+
+    # Pooled token level.
+    assert summary.total_answer_tokens == 6
+    assert summary.mean_token_logprob == pytest.approx(-8.0 / 6)
+    assert summary.std_token_logprob == pytest.approx(
+        (15.5 / 6 - (8.0 / 6) ** 2) ** 0.5
+    )
+    assert summary.median_token_logprob == pytest.approx(-1.0, abs=0.02)  # mid of 6
+
+    # Per-sample level: median of sample means (-1.5, -2/3, -3) is -1.5, distinct
+    # from both the sample-mean mean and the pooled token mean.
+    sample_means = [-1.5, -2.0 / 3.0, -3.0]
+    assert summary.mean_logprob == pytest.approx(sum(sample_means) / 3)
+    assert summary.median_logprob == pytest.approx(-1.5)
+    assert summary.median_logprob != pytest.approx(summary.mean_logprob)
+    assert summary.median_answer_tokens == pytest.approx(2.0)  # median of {2,3,1}
+
+
+def test_scratch_dir_routes_tokens_to_scratch_only(monkeypatch, tmp_path) -> None:
+    """With evaluation.scratch_dir set, tokens.jsonl lands only in scratch while
+    summary.json/samples.jsonl are mirrored to both the run dir and scratch."""
+    monkeypatch.setattr(
+        "cot_compression.training.evaluate.AutoTokenizer", FakeSFTTokenizer
+    )
+    monkeypatch.setattr(
+        "cot_compression.training.evaluate.AutoModelForCausalLM", TinySFTModel
+    )
+    examples = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": f"Q{i}"},
+                    {
+                        "role": "assistant",
+                        "content": f"<think>{'reasoning ' * (2 + i)}</think> A{i}",
+                    },
+                ],
+                "dataset_source": "valid",
+                "id": f"ok-{i}",
+            }
+            for i in range(4)
+        ]
+    )
+    monkeypatch.setattr(
+        "cot_compression.training.evaluate.load_dolci_sft_data",
+        lambda cfg: DolciSFTData(train=examples, eval=examples, test=examples),
+    )
+    scratch = tmp_path / "scratch"
+    cfg = _eval_cfg(
+        tmp_path / "home",
+        {"enabled": ["base"], "patching": _PATCHING},
+        scratch_dir=str(scratch),
+    )
+    summary_path = evaluate_methods(cfg)
+
+    home = summary_path.parent  # <run_dir>/artifacts
+    # run_dir.name is "eval" (paths.run_dir = <home>/eval), so scratch mirrors it.
+    scratch_art = scratch / "eval" / "artifacts"
+    assert (home / "summary.json").exists() and (home / "samples.jsonl").exists()
+    assert not (home / "tokens.jsonl").exists()  # kept off HOME
+    assert (scratch_art / "tokens.jsonl").exists()
+    assert (scratch_art / "summary.json").exists()
+    # The mirrored summary is byte-identical to the run-dir copy.
+    assert (scratch_art / "summary.json").read_text() == (
+        home / "summary.json"
+    ).read_text()
+
+
+def test_worker_prefetch_matches_serial_prep(monkeypatch, tmp_path) -> None:
+    """DataLoader workers must not change any output vs main-thread prep.
+
+    Prep is deterministic in (sample_index, seed) and order-independent, and the
+    forward runs in the main process either way, so moving tokenization into
+    workers must be bit-for-bit invisible in all three artifacts.
+    """
+    examples = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": f"Question {i}"},
+                    {
+                        "role": "assistant",
+                        "content": f"<think>{'reasoning ' * (3 + i)}</think> Answer {i}",
+                    },
+                ],
+                "dataset_source": "valid",
+                "id": f"ok-{i}",
+            }
+            for i in range(6)
+        ]
+    )
+
+    serial = _run_eval_artifacts(monkeypatch, tmp_path, examples, num_workers=0)
+    workers = _run_eval_artifacts(monkeypatch, tmp_path, examples, num_workers=2)
+    assert serial == workers
+
+
+def test_preflight_length_check_raises_on_over_length_cot() -> None:
+    from cot_compression.training.evaluate import preflight_length_check
+    from cot_compression.training.logging import RunLogger
+
+    logger = object.__new__(RunLogger)  # bypass wandb/file setup; only .info used
+    logger.info = lambda message: None  # type: ignore[method-assign]
+    entropies = {0: torch.zeros(10), 4: torch.zeros(50)}
+
+    # Within the window: no raise.
+    preflight_length_check(entropies, 64, logger)
+    # A CoT past the window names the offending sample and its length.
+    with pytest.raises(ValueError, match="sample 4 is 50 tokens"):
+        preflight_length_check(entropies, 32, logger)
+
+
+def test_over_length_guard_drops_same_samples_for_every_method(
+    monkeypatch, tmp_path
+) -> None:
+    """The length guard keys on the CoT count, so base and compressed drop the
+    same sample -- the paired comparison stays over one population."""
+    from cot_compression.training.evaluate import PrepDataset
+
+    tokenizer = FakeSFTTokenizer()
+    examples = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "Q"},
+                    {
+                        "role": "assistant",
+                        "content": f"<think>{'x' * length}</think> A",
+                    },
+                ],
+                "dataset_source": "valid",
+                "id": f"len-{length}",
+            }
+            for length in (5, 100)
+        ]
+    )
+    placeholder_id = tokenizer.convert_tokens_to_ids("<|vision_pad|>")
+
+    def kept_indices(method_name, patching):
+        from cot_compression.compression import build_compression_methods
+
+        cfg = _eval_cfg(
+            tmp_path,
+            {
+                "enabled": [method_name],
+                "patching": _PATCHING,
+                method_name: {"patching": patching},
+            },
+        )
+        method = build_compression_methods(cfg)[0]
+        prep = PrepDataset(
+            examples,
+            tokenizer,
+            method,
+            limit=len(examples),
+            seed=7,
+            max_length=None,
+            max_position_embeddings=40,  # the 100-char CoT is over, the 5-char one fits
+            span_counts=None,
+            cot_ids_cache={},
+            placeholder_id=int(placeholder_id),
+        )
+        return [i for i in range(len(examples)) if prep[i] is not None]
+
+    # Base (uncompressed) and a compressed method drop the identical sample set,
+    # even though the compressed rendering is far shorter than the window.
+    assert kept_indices("base", None) == [0]
+    assert kept_indices("simple_mean", "uniform") == [0]
+
+
+def test_token_writer_output_matches_json_dumps(tmp_path) -> None:
+    """The %-format fast path must be byte-identical to json.dumps(asdict(...)).
+
+    tokens.jsonl is consumed by a byte-slicing parser
+    (reporting/sweep_stats.py), so the exact key order, separators and float
+    formatting are a contract, not an implementation detail.
+    """
+    path = tmp_path / "tokens.jsonl"
+    method = "entropy_weighted_mean_t0.5_entropy_sum_cr4"
+    logprobs = [-0.5, -1.0 / 3.0, -1.2345678901234567e-08, -123.456, 0.0]
+    writer = TokenLogprobWriter(path, queue_size=2)
+    writer.submit(
+        json.dumps(method), 7, [1, 2, 3, 4, 5], [10, 11, 12, 13, 14], logprobs
+    )
+    # A second sample, to pin down that rows stay grouped in submission order.
+    writer.submit(json.dumps(method), 3, [1], [15], [-2.5])
+    writer.close()
+
+    expected = [
+        json.dumps(
+            {
+                "method": method,
+                "sample_index": 7,
+                "token_index": index,
+                "token_id": token_id,
+                "logprob": logprob,
+            }
+        )
+        for index, token_id, logprob in zip(
+            [1, 2, 3, 4, 5], [10, 11, 12, 13, 14], logprobs, strict=True
+        )
+    ]
+    expected.append(json.dumps(asdict(TokenScore(method, 3, 1, 15, -2.5))))
+    assert path.read_text(encoding="utf-8").splitlines() == expected
+
+
+def test_token_writer_keeps_non_finite_logprobs_valid_json(tmp_path) -> None:
+    """repr() spells -inf/nan in a way json.loads rejects; dumps must be used."""
+    path = tmp_path / "tokens.jsonl"
+    writer = TokenLogprobWriter(path)
+    writer.submit(json.dumps("base"), 0, [1, 2], [5, 6], [-1.5, float("-inf")])
+    writer.close()
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["logprob"] for line in lines] == [-1.5, float("-inf")]
+
+
+def test_token_writer_reraises_writer_thread_failure(tmp_path) -> None:
+    """A failed write (e.g. disk quota) must surface, not deadlock the producer."""
+    path = tmp_path / "tokens.jsonl"
+    writer = TokenLogprobWriter(path, queue_size=1)
+    writer._handle.close()  # simulate the handle dying mid-run
+
+    with pytest.raises(ValueError):
+        for index in range(100):
+            writer.submit(json.dumps("base"), index, [1], [2], [-1.0])
+            time.sleep(0.001)

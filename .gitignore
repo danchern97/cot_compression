@@ -27,7 +27,7 @@ data/**/train.npy
 data/**/val.npy
 data/**/tokenizer.json
 data/**/meta.json
-data/entropy_cache/cot_entropies__Qwen__Qwen3-4B.npz
+data/entropy_cache/
 
 # OS/editor
 .DS_Store
@@ -35,5 +35,5 @@ data/entropy_cache/cot_entropies__Qwen__Qwen3-4B.npz
 .vscode/
 src/cot_compression/reporting/report_template.html
 EXPERIMENTS.md
-scripts/build_sweep_report.py
-scripts/run_entropy_sweep.sh
+scripts/
+CLAUDE.md

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import torch
 
+from cot_compression.signals import SIGNALS
+
 
 @dataclass(frozen=True)
 class PatchingMethod:
@@ -17,9 +19,14 @@ class PatchingMethod:
 
     name: str
 
-    def requires_entropies(self) -> bool:
-        """Whether split() needs per-token entropies to decide boundaries."""
-        return False
+    def required_signal(self) -> str | None:
+        """Which per-token signal split() needs, or None if it needs none.
+
+        A signal is one of the names in ``cot_compression.signals.SIGNALS``
+        (``entropy`` / ``surprisal``); the caller supplies that signal's values
+        as ``split``'s ``values`` argument.
+        """
+        return None
 
     @property
     def param_tag(self) -> str:
@@ -31,7 +38,7 @@ class PatchingMethod:
         num_tokens: int,
         sample_index: int,
         seed: int,
-        entropies: torch.Tensor | None,
+        values: torch.Tensor | None,
     ) -> list[tuple[int, int]]:
         raise NotImplementedError
 
@@ -66,9 +73,9 @@ class UniformPatchingMethod(PatchingMethod):
         num_tokens: int,
         sample_index: int,
         seed: int,
-        entropies: torch.Tensor | None,
+        values: torch.Tensor | None,
     ) -> list[tuple[int, int]]:
-        del sample_index, seed, entropies
+        del sample_index, seed, values
         return [
             (start, min(start + self.patch_size, num_tokens))
             for start in range(0, num_tokens, self.patch_size)
@@ -96,9 +103,9 @@ class RandomPatchingMethod(PatchingMethod):
         num_tokens: int,
         sample_index: int,
         seed: int,
-        entropies: torch.Tensor | None,
+        values: torch.Tensor | None,
     ) -> list[tuple[int, int]]:
-        del entropies
+        del values
         rng = random.Random(seed + sample_index)
         spans = []
         start = 0
@@ -111,134 +118,140 @@ class RandomPatchingMethod(PatchingMethod):
 
 
 @dataclass(frozen=True)
-class EntropyPatchingMethod(PatchingMethod):
-    """Abstract base for entropy-driven patching strategies.
+class SignalPatchingMethod(PatchingMethod):
+    """Abstract base for signal-driven patching strategies.
 
-    All entropy strategies are parameterized by a single universal knob,
-    ``compression_ratio`` (= original_len / compressed_len = target average
-    patch length, >= 1), and derive their per-trace splitting constraint
-    (percentile threshold, monotonic-difference threshold, or information
-    budget) so that the *realized* average patch length matches the target in
-    expectation. Subclasses implement ``split``.
+    A ``signal`` (``entropy`` or ``surprisal``) supplies one non-negative value
+    per CoT token; the strategy places boundaries from that signal. All are
+    parameterized by a single universal knob, ``compression_ratio`` (=
+    original_len / compressed_len = target average patch length, >= 1), and
+    derive their per-trace splitting constraint (percentile threshold,
+    monotonic-difference threshold, or information budget) so that the *realized*
+    average patch length matches the target in expectation. Subclasses implement
+    ``split``; the same code works for any signal, only ``name`` differs.
     """
 
     compression_ratio: float
+    signal: str
 
-    def __init__(self, compression_ratio: float, name: str) -> None:
+    def __init__(self, compression_ratio: float, signal: str, rule: str) -> None:
         if compression_ratio < 1.0:
             raise ValueError("compression_ratio must be >= 1.")
-        super().__init__(name=name)
+        if signal not in SIGNALS:
+            raise ValueError(f"Unknown signal {signal!r}. Expected one of {SIGNALS}.")
+        super().__init__(name=f"{signal}_{rule}")
         object.__setattr__(self, "compression_ratio", float(compression_ratio))
+        object.__setattr__(self, "signal", signal)
 
     @property
     def param_tag(self) -> str:
         return f"cr{self.compression_ratio:g}"
 
-    def requires_entropies(self) -> bool:
-        return True
+    def required_signal(self) -> str | None:
+        return self.signal
 
 
 @dataclass(frozen=True)
-class EntropyThresholdPatchingMethod(EntropyPatchingMethod):
+class SignalThresholdPatchingMethod(SignalPatchingMethod):
     """Global-constraint patching: start a new patch immediately before every
-    token whose entropy is at or above the ``1 - 1/compression_ratio`` quantile
-    of this trace's token entropies.
+    token whose signal is at or above the ``1 - 1/compression_ratio`` quantile
+    of this trace's token signal values.
 
-    A high-entropy token always begins a new patch, never grouped with what
+    A high-signal token always begins a new patch, never grouped with what
     preceded it. Roughly a ``1/compression_ratio`` fraction of tokens clear the
     threshold, so the trace splits into ~L/compression_ratio patches, i.e. an
     average patch length ~= compression_ratio.
     """
 
-    def __init__(self, compression_ratio: float = 2.0) -> None:
-        super().__init__(compression_ratio, name="entropy_threshold")
+    def __init__(self, compression_ratio: float = 2.0, signal: str = "entropy") -> None:
+        super().__init__(compression_ratio, signal, rule="threshold")
 
     def split(
         self,
         num_tokens: int,
         sample_index: int,
         seed: int,
-        entropies: torch.Tensor | None,
+        values: torch.Tensor | None,
     ) -> list[tuple[int, int]]:
         del sample_index, seed
-        assert entropies is not None
+        assert values is not None
         # torch.quantile does not support bfloat16 (the model's usual dtype).
         quantile = 1.0 - 1.0 / self.compression_ratio
-        threshold = torch.quantile(entropies[:num_tokens].float(), quantile)
+        threshold = torch.quantile(values[:num_tokens].float(), quantile)
         # Compare on device and move the boundary indices across in a single
-        # transfer. Testing `entropies[i] >= threshold` inside a Python loop
+        # transfer. Testing `values[i] >= threshold` inside a Python loop
         # instead costs one host-device sync per CoT token (~10k per sample),
-        # which dominated evaluation runtime for entropy patching.
-        starts = (entropies[1:num_tokens] >= threshold).nonzero(as_tuple=True)[0]
+        # which dominated evaluation runtime for signal patching.
+        starts = (values[1:num_tokens] >= threshold).nonzero(as_tuple=True)[0]
         boundaries = [0] + (starts + 1).tolist() + [num_tokens]
         return list(zip(boundaries[:-1], boundaries[1:], strict=True))
 
 
 @dataclass(frozen=True)
-class EntropyDiffPatchingMethod(EntropyPatchingMethod):
+class SignalDiffPatchingMethod(SignalPatchingMethod):
     """Approximate monotonic-constraint patching (BLT, arXiv:2412.09871).
 
-    Starts a new patch before token t when the entropy rises sharply from the
-    previous token, H(x_t) - H(x_{t-1}) > theta_r, with theta_r set to the
-    ``1 - 1/compression_ratio`` quantile of the consecutive entropy differences.
+    Starts a new patch before token t when the signal rises sharply from the
+    previous token, s(x_t) - s(x_{t-1}) > theta_r, with theta_r set to the
+    ``1 - 1/compression_ratio`` quantile of the consecutive signal differences.
     A ~1/compression_ratio fraction of positions clear theta_r, giving an
     average patch length ~= compression_ratio.
     """
 
-    def __init__(self, compression_ratio: float = 2.0) -> None:
-        super().__init__(compression_ratio, name="entropy_diff")
+    def __init__(self, compression_ratio: float = 2.0, signal: str = "entropy") -> None:
+        super().__init__(compression_ratio, signal, rule="diff")
 
     def split(
         self,
         num_tokens: int,
         sample_index: int,
         seed: int,
-        entropies: torch.Tensor | None,
+        values: torch.Tensor | None,
     ) -> list[tuple[int, int]]:
         del sample_index, seed
-        assert entropies is not None
+        assert values is not None
         if num_tokens <= 1:
             return [(0, num_tokens)]
-        entropy = entropies[:num_tokens].float()
-        diffs = entropy[1:] - entropy[:-1]  # diffs[i] = H[i+1] - H[i]
+        signal = values[:num_tokens].float()
+        diffs = signal[1:] - signal[:-1]  # diffs[i] = s[i+1] - s[i]
         quantile = 1.0 - 1.0 / self.compression_ratio
         theta_r = torch.quantile(diffs, quantile)
-        # A boundary before token i+1 when its entropy jumps past theta_r.
+        # A boundary before token i+1 when its signal jumps past theta_r.
         starts = (diffs > theta_r).nonzero(as_tuple=True)[0]
         boundaries = [0] + (starts + 1).tolist() + [num_tokens]
         return list(zip(boundaries[:-1], boundaries[1:], strict=True))
 
 
 @dataclass(frozen=True)
-class EntropySumPatchingMethod(EntropyPatchingMethod):
+class SignalSumPatchingMethod(SignalPatchingMethod):
     """Equal-information (B-budget) patching: cut whenever the cumulative token
-    entropy since the last cut passes an information budget B.
+    signal since the last cut passes an information budget B.
 
-    B is chosen from the target ratio as B = total_entropy * compression_ratio
+    B is chosen from the target ratio as B = total_signal * compression_ratio
     / num_tokens, so the trace splits into ~round(num_tokens / compression_ratio)
-    patches of roughly equal summed entropy, giving an average patch length
+    patches of roughly equal summed signal, giving an average patch length
     ~= compression_ratio. Implemented via a vectorized cumulative-sum +
     searchsorted (equivalent to the sequential "sum exceeds B" greedy) to avoid
     a Python loop over tokens.
     """
 
-    def __init__(self, compression_ratio: float = 2.0) -> None:
-        super().__init__(compression_ratio, name="entropy_sum")
+    def __init__(self, compression_ratio: float = 2.0, signal: str = "entropy") -> None:
+        super().__init__(compression_ratio, signal, rule="sum")
 
     def split(
         self,
         num_tokens: int,
         sample_index: int,
         seed: int,
-        entropies: torch.Tensor | None,
+        values: torch.Tensor | None,
     ) -> list[tuple[int, int]]:
         del sample_index, seed
-        assert entropies is not None
+        assert values is not None
         if num_tokens <= 1:
             return [(0, num_tokens)]
-        cum = torch.cumsum(entropies[:num_tokens].float(), dim=0)
+        cum = torch.cumsum(values[:num_tokens].float(), dim=0)
         total = cum[-1]
-        # Degenerate all-zero-entropy trace: fall back to uniform chunks so we
+        # Degenerate all-zero-signal trace: fall back to uniform chunks so we
         # still hit the target ratio instead of returning one giant patch.
         if float(total) <= 0.0:
             size = max(1, round(self.compression_ratio))

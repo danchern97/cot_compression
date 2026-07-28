@@ -2,16 +2,35 @@ seed: 1337
 device: auto
 torch_dtype: bfloat16
 max_length: null
-batch_size: 4
+# Non-binding row cap: max_batch_tokens is what actually limits a batch. It
+# matters once a compressed CoT is short enough that the token budget no longer
+# ends the batch -- at high compression ratios this drives most of the speedup.
+batch_size: 64
 max_batch_tokens: 32768
+# DataLoader worker processes for per-sample CPU prep (tokenization dominates
+# eval CPU time). 0 keeps prep on the main thread. snellius_h100 allocates 16
+# cores; 14 leaves one for the main process and one for the writer thread.
+num_workers: 14
+# In-flight samples per worker; bounds prep memory (num_workers * this * ~sample).
+prefetch_factor: 4
 max_examples: null
 metric: answer_logprob
 normalize_by_length: true
 save_token_logprobs: true
-# Directory holding the precomputed CoT-entropy cache (npz). Null => compute
-# inline on demand. Point it at a persistent path to reuse across a sweep.
-# CoT entropies are always conditioned on the full prompt (never isolated).
+# Directory holding the precomputed CoT-signal caches (one npz per signal, keyed
+# by model). Null => compute inline on demand. Point it at a persistent path to
+# reuse across a sweep. CoT signals are always conditioned on the full prompt
+# (never isolated). The name is historical -- it now holds every signal cache.
 entropy_cache_dir: null
+# Which per-token signals `precompute` computes and caches. Both come from one
+# forward pass, so caching both is nearly free.
+precompute_signals: [entropy, surprisal]
+# Optional scratch mirror. When set, the large tokens.jsonl (and answer-entropy
+# npz) are written ONLY under <scratch_dir>/<job>/artifacts, while the small
+# summary.json/samples.jsonl go to both the run dir and here. Keeps the ~0.7 GB/
+# job token stream off a quota-limited HOME run dir. Null => everything in the
+# run dir. Point it at /scratch-shared/$USER/... on Snellius.
+scratch_dir: null
 # Save per-config answer-token entropies (artifacts/answer_entropies.npz).
 save_entropies: false
 methods:
@@ -20,9 +39,11 @@ methods:
     - random
   patching:
     # Target compression ratio (= original_len / compressed_len = average patch
-    # length, >= 1). Shared universal knob for uniform and every entropy-based
-    # strategy (entropy_threshold, entropy_diff, entropy_sum); each derives its
-    # own splitting constraint so the realized average patch length matches it.
+    # length, >= 1). Shared universal knob for uniform and every signal-based
+    # strategy. Signal patching strategies are "<signal>_<rule>" with signal in
+    # {entropy, surprisal} and rule in {threshold, diff, sum} -- e.g.
+    # entropy_sum, surprisal_threshold; each derives its own splitting constraint
+    # so the realized average patch length matches this ratio.
     compression_ratio: 2.0
     random:
       max_exponent: 6
@@ -34,4 +55,9 @@ methods:
     patching: null
     # softmax(ln H / T) pooling temperature: T=1 -> plain entropy-weighted mean,
     # T=0 -> keep only the highest-entropy token per patch.
+    temperature: 1.0
+  surprisal_weighted_mean:
+    patching: null
+    # softmax(ln(-log p) / T) pooling temperature: T=1 -> weight by surprisal
+    # share, T=0 -> keep only the highest-surprisal token per patch.
     temperature: 1.0

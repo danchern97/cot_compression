@@ -8,13 +8,15 @@ import torch
 
 import cot_compression.compression as compression
 from cot_compression.compression import (
-    EntropyWeightedMeanCompressionMethod,
+    NoCotCompressionMethod,
     RandomCompressionMethod,
+    SignalWeightedMeanCompressionMethod,
     SimpleMeanCompressionMethod,
 )
 from cot_compression.data.answers import cot_token_ids, extract_answer_trace
 from cot_compression.patching import (
-    EntropyThresholdPatchingMethod,
+    SignalSumPatchingMethod,
+    SignalThresholdPatchingMethod,
     UniformPatchingMethod,
 )
 
@@ -126,58 +128,99 @@ def test_random_is_deterministic_and_uses_regular_vocab() -> None:
     assert torch.equal(first.slot_embeddings, model.emb.weight[ids])
 
 
-def test_entropy_methods_require_entropy() -> None:
+def test_signal_weighted_mean_requires_its_signal() -> None:
     tokenizer, model = MiniTokenizer(), MiniModel()
     trace = _trace()
-    # entropy_weighted_mean always needs entropies, even without entropy patching.
-    method = EntropyWeightedMeanCompressionMethod(
+    # A signal-weighted mean always needs its signal, even without signal patching.
+    method = SignalWeightedMeanCompressionMethod(
         UniformPatchingMethod(compression_ratio=4)
     )
-    assert method.needs_entropies()
+    assert method.required_signals() == frozenset({"entropy"})
     with pytest.raises(ValueError):
         method.compress(trace, 0, 0, tokenizer, model, DEVICE, None)
 
 
-def test_cache_fed_entropy_reproduces_spans_and_slots() -> None:
+def test_mixed_signals_are_both_required() -> None:
+    # Weight by surprisal, patch by entropy: the method must declare both, and
+    # both must be present or the sample is skipped (ValueError).
+    tokenizer, model = MiniTokenizer(), MiniModel()
+    trace = _trace()
+    t = len(cot_token_ids(trace, tokenizer))
+    method = SignalWeightedMeanCompressionMethod(
+        SignalThresholdPatchingMethod(compression_ratio=2.0, signal="entropy"),
+        signal="surprisal",
+    )
+    assert method.required_signals() == frozenset({"entropy", "surprisal"})
+    with pytest.raises(ValueError):
+        # Only entropy supplied; surprisal (the pooling signal) is missing.
+        method.compress(
+            trace, 0, 0, tokenizer, model, DEVICE, {"entropy": torch.rand(t)}
+        )
+
+
+def test_cache_fed_signal_reproduces_spans_and_slots() -> None:
     tokenizer, model = MiniTokenizer(), MiniModel()
     trace = _trace()
     t = len(cot_token_ids(trace, tokenizer))
     entropy = torch.linspace(0.1, 1.0, t)  # stand-in cached CoT entropies
 
-    method = EntropyWeightedMeanCompressionMethod(
-        EntropyThresholdPatchingMethod(compression_ratio=2.0)
+    method = SignalWeightedMeanCompressionMethod(
+        SignalThresholdPatchingMethod(compression_ratio=2.0)
     )
-    a = method.compress(trace, 0, 0, tokenizer, model, DEVICE, entropy.clone())
-    b = method.compress(trace, 0, 0, tokenizer, model, DEVICE, entropy.clone())
+    a = method.compress(
+        trace, 0, 0, tokenizer, model, DEVICE, {"entropy": entropy.clone()}
+    )
+    b = method.compress(
+        trace, 0, 0, tokenizer, model, DEVICE, {"entropy": entropy.clone()}
+    )
 
     assert a.compressed_cot_tokens == b.compressed_cot_tokens
     assert torch.equal(a.slot_embeddings, b.slot_embeddings)
-    # Entropy patching actually split into more than one patch here.
+    # Signal patching actually split into more than one patch here.
     assert a.compressed_cot_tokens > 1
 
 
-def test_entropy_sum_patching_with_zero_temperature_compress_path() -> None:
-    # End-to-end compress() over the new entropy_sum patching + T=0 pooling:
+def test_no_cot_produces_empty_think_block() -> None:
+    tokenizer, model = MiniTokenizer(), MiniModel()
+    trace = _trace()
+    t = len(cot_token_ids(trace, tokenizer))
+    method = NoCotCompressionMethod()
+
+    assert method.required_signals() == frozenset()
+    result = method.compress(trace, 0, 0, tokenizer, model, DEVICE, None)
+
+    assert result.slot_embeddings is None  # text path, no splicing
+    assert result.original_cot_tokens == t
+    assert result.compressed_cot_tokens == 0
+    content = result.messages[-1]["content"]
+    assert "<think></think>" in content  # empty interior, tags kept
+    assert "aaaa" not in content
+
+
+def test_surprisal_sum_patching_with_zero_temperature_compress_path() -> None:
+    # End-to-end compress() over surprisal_sum patching + surprisal T=0 pooling:
     # spans partition the CoT, one slot per patch, and each slot is exactly the
-    # embedding of its patch's highest-entropy token (one-hot at T=0).
+    # embedding of its patch's highest-surprisal token (one-hot at T=0).
     tokenizer, model = MiniTokenizer(), MiniModel()
     trace = _trace()
     cot_ids = cot_token_ids(trace, tokenizer)
     t = len(cot_ids)
-    entropy = torch.linspace(0.1, 1.0, t)
+    surprisal = torch.linspace(0.1, 1.0, t)
 
-    from cot_compression.patching import EntropySumPatchingMethod
+    patching = SignalSumPatchingMethod(compression_ratio=2.0, signal="surprisal")
+    method = SignalWeightedMeanCompressionMethod(
+        patching, temperature=0.0, signal="surprisal"
+    )
+    result = method.compress(
+        trace, 0, 0, tokenizer, model, DEVICE, {"surprisal": surprisal.clone()}
+    )
 
-    patching = EntropySumPatchingMethod(compression_ratio=2.0)
-    method = EntropyWeightedMeanCompressionMethod(patching, temperature=0.0)
-    result = method.compress(trace, 0, 0, tokenizer, model, DEVICE, entropy.clone())
-
-    spans = patching.split(t, 0, 0, entropy)
+    spans = patching.split(t, 0, 0, surprisal)
     assert result.compressed_cot_tokens == len(spans)
     assert result.slot_embeddings.shape == (len(spans), 8)
     embeds = model.emb(torch.tensor(cot_ids))
     for row, (start, end) in enumerate(spans):
-        argmax = start + int(entropy[start:end].argmax())
+        argmax = start + int(surprisal[start:end].argmax())
         assert torch.allclose(result.slot_embeddings[row], embeds[argmax], atol=1e-6)
 
 
@@ -187,18 +230,27 @@ def test_method_naming_encodes_patching_param() -> None:
         == "simple_mean_uniform_cr8"
     )
     assert (
-        EntropyWeightedMeanCompressionMethod(EntropyThresholdPatchingMethod(2.0)).name
+        SignalWeightedMeanCompressionMethod(SignalThresholdPatchingMethod(2.0)).name
         == "entropy_weighted_mean_t1_entropy_threshold_cr2"
     )
+    # Surprisal is a parallel family: same composition, "surprisal" in place of
+    # "entropy" for both the pooling family and the patching name.
+    assert (
+        SignalWeightedMeanCompressionMethod(
+            SignalSumPatchingMethod(4.0, signal="surprisal"), signal="surprisal"
+        ).name
+        == "surprisal_weighted_mean_t1_surprisal_sum_cr4"
+    )
     assert RandomCompressionMethod().name == "random"
+    assert NoCotCompressionMethod().name == "no_cot"
 
 
 def test_method_naming_encodes_temperature() -> None:
     # Distinct temperatures must yield distinct method names so sweep cells that
     # share a (family, patching, ratio) do not collapse in aggregation.
-    patching = EntropyThresholdPatchingMethod(4.0)
+    patching = SignalThresholdPatchingMethod(4.0)
     names = {
-        EntropyWeightedMeanCompressionMethod(patching, temperature=t).name
+        SignalWeightedMeanCompressionMethod(patching, temperature=t).name
         for t in (0.0, 0.5, 1.0)
     }
     assert names == {
@@ -206,7 +258,7 @@ def test_method_naming_encodes_temperature() -> None:
         "entropy_weighted_mean_t0.5_entropy_threshold_cr4",
         "entropy_weighted_mean_t1_entropy_threshold_cr4",
     }
-    method = EntropyWeightedMeanCompressionMethod(patching, temperature=0.5)
+    method = SignalWeightedMeanCompressionMethod(patching, temperature=0.5)
     assert method.compression_param == "t0.5"
 
 
@@ -218,7 +270,7 @@ def _weighted_reduce(entropy_rows: torch.Tensor, temperature: float) -> torch.Te
     """
     num_tokens = entropy_rows.shape[1]
     embeds = torch.eye(num_tokens).unsqueeze(0)  # [1, n, n]
-    method = EntropyWeightedMeanCompressionMethod(temperature=temperature)
+    method = SignalWeightedMeanCompressionMethod(temperature=temperature)
     return method.reduce_patches(embeds, entropy_rows)[0]
 
 
@@ -248,4 +300,4 @@ def test_temperature_between_is_sharper_than_mean_weighting() -> None:
 
 def test_negative_temperature_rejected() -> None:
     with pytest.raises(ValueError):
-        EntropyWeightedMeanCompressionMethod(temperature=-1.0)
+        SignalWeightedMeanCompressionMethod(temperature=-1.0)
