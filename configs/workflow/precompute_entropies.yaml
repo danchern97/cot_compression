@@ -11,7 +11,7 @@ defaults:
 mode: precompute_entropies
 
 logging:
-  project: qwen3-answer-loss
+  group: precompute
   log_file_name: precompute.log
   tags:
     - qwen3

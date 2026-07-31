@@ -6,9 +6,10 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 from omegaconf import OmegaConf
 from torch import nn
 from torch.nn import functional as F
@@ -21,7 +22,7 @@ from cot_compression.training.evaluate import (
     evaluate_methods,
     summarize_method,
 )
-from cot_compression.training.sft import train_sft
+from cot_compression.training.sft import ChunkedCELM, plan_epoch, train_sft
 
 _PATCHING = {
     "compression_ratio": 4.0,
@@ -166,35 +167,66 @@ class FakeSFTTokenizer:
         return self._token_to_id.get(token, self.unk_token_id)
 
 
+class TinyBackbone(nn.Module):
+    """Stands in for `Qwen3Model`: returns `last_hidden_state`, no head."""
+
+    def __init__(self, vocab: int, hidden: int) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab, hidden)
+
+    def forward(self, input_ids=None, attention_mask=None):
+        del attention_mask
+        return SimpleNamespace(last_hidden_state=self.embed_tokens(input_ids))
+
+
 class TinySFTModel(nn.Module):
+    """Mirrors the HF causal-LM shape the two paths rely on: `.model` + `.lm_head`
+    for the SFT chunked-CE wrapper, and a `forward` taking `inputs_embeds` for the
+    embedding-splicing eval path."""
+
     def __init__(self) -> None:
         super().__init__()
         self.config = SimpleNamespace(use_cache=True)
-        self.embedding = nn.Embedding(512, 8)
+        self.model = TinyBackbone(512, 8)
         self.lm_head = nn.Linear(8, 128)
 
     @classmethod
-    def from_pretrained(cls, *args, **kwargs):
-        return cls()
+    def from_pretrained(cls, name_or_path=None, *args, **kwargs):
+        model = cls()
+        # Actually restore when handed a checkpoint directory. A fake that always
+        # returns fresh weights would let the resume test pass while resume was
+        # silently broken -- and would make it fail while resume was correct.
+        weights = Path(str(name_or_path)) / "model.pt" if name_or_path else None
+        if weights is not None and weights.exists():
+            model.load_state_dict(torch.load(weights, map_location="cpu"))
+        return model
 
-    def gradient_checkpointing_enable(self) -> None:
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None) -> None:
+        del gradient_checkpointing_kwargs
         return None
 
     def resize_token_embeddings(self, size: int, mean_resizing: bool = False) -> None:
         del mean_resizing
         self.lm_head = nn.Linear(8, size)
 
-    def save_pretrained(self, path) -> None:
-        torch.save(self.state_dict(), Path(path) / "model.pt")
+    def save_pretrained(self, path, state_dict=None) -> None:
+        torch.save(
+            self.state_dict() if state_dict is None else state_dict,
+            Path(path) / "model.pt",
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
-        return self.embedding
+        return self.model.embed_tokens
 
     def forward(
         self, input_ids=None, attention_mask=None, inputs_embeds=None, labels=None
     ):
         del attention_mask
-        embeds = self.embedding(input_ids) if inputs_embeds is None else inputs_embeds
+        embeds = (
+            self.model.embed_tokens(input_ids)
+            if inputs_embeds is None
+            else inputs_embeds
+        )
         logits = self.lm_head(embeds)
         loss = None
         if labels is not None:
@@ -206,65 +238,67 @@ class TinySFTModel(nn.Module):
         return SimpleNamespace(loss=loss, logits=logits)
 
 
-def test_plain_sft_training_step(monkeypatch, tmp_path) -> None:
-    examples = Dataset.from_list(
-        [
+def _tokenized_split(rows: int, seed: int) -> Dataset:
+    rng = np.random.default_rng(seed)
+    records = []
+    for index in range(rows):
+        length = int(rng.integers(8, 24))
+        records.append(
             {
-                "messages": [
-                    {"role": "user", "content": "Question"},
-                    {"role": "assistant", "content": "<think>Trace</think>\nAnswer"},
-                ],
-                "dataset_source": "test",
-                "id": "0",
+                "input_ids": rng.integers(1, 64, length).tolist(),
+                "label_start": int(rng.integers(2, length - 2)),
+                "length": length,
+                "id": str(index),
             }
-        ]
-    )
+        )
+    return Dataset.from_list(records)
 
-    monkeypatch.setattr(
-        "cot_compression.training.sft.AutoTokenizer",
-        FakeSFTTokenizer,
-    )
-    monkeypatch.setattr(
-        "cot_compression.training.sft.AutoModelForCausalLM",
-        TinySFTModel,
-    )
-    monkeypatch.setattr(
-        "cot_compression.training.sft.load_dolci_sft_data",
-        lambda cfg: DolciSFTData(train=examples, eval=examples, test=examples),
-    )
 
-    cfg = OmegaConf.create(
+def _sft_cfg(tmp_path, **training_overrides):
+    training = {
+        "seed": 7,
+        "device": "cpu",
+        "deterministic": True,
+        "torch_dtype": "float32",
+        "autocast_dtype": "bfloat16",
+        "attn_implementation": "sdpa",
+        "num_train_epochs": 1,
+        "max_train_examples": None,
+        "max_length": 64,
+        "max_batch_tokens": 64,
+        "length_group_size": 8,
+        "micro_batch_max_sequences": 2,
+        "target_global_batch": 4,
+        "ce_chunk_tokens": 8,
+        "num_workers": 0,
+        "prefetch_factor": 2,
+        "warmup_ratio": 0.0,
+        "min_warmup_steps": 0,
+        "schedule_horizon_steps": None,
+        "gradient_clip": 1.0,
+        "gradient_checkpointing": False,
+        "compile": False,
+        "max_steps": None,
+        "eval_interval": 1000,
+        "eval_examples": 8,
+        "log_interval": 1000,
+        "checkpoint_minutes": 1e9,
+        "keep_checkpoints": 2,
+        "resume_from_checkpoint": "auto",
+    }
+    training.update(training_overrides)
+    return OmegaConf.create(
         {
             "paths": {"run_dir": str(tmp_path / "sft")},
-            "data": {"prepared_dir": str(tmp_path / "data")},
+            "data": {"name": "tiny"},
             "method": {
                 "model_name": "tiny",
                 "trust_remote_code": False,
                 "use_fast_tokenizer": True,
             },
-            "training": {
-                "seed": 7,
-                "device": "cpu",
-                "deterministic": False,
-                "torch_dtype": "float32",
-                "num_train_epochs": 1,
-                "max_steps": 1,
-                "batch_size": 1,
-                "eval_batch_size": 1,
-                "gradient_accumulation_steps": 1,
-                "max_length": 128,
-                "warmup_ratio": 0.0,
-                "eval_interval": 1,
-                "eval_iters": 1,
-                "checkpoint_interval": 1,
-                "log_interval": 1,
-                "gradient_clip": 1.0,
-                "gradient_checkpointing": False,
-                "compile": False,
-                "resume_from_checkpoint": None,
-            },
+            "training": training,
             "optim": {
-                "lr": 0.001,
+                "lr": 0.01,
                 "weight_decay": 0.0,
                 "beta1": 0.9,
                 "beta2": 0.95,
@@ -279,15 +313,219 @@ def test_plain_sft_training_step(monkeypatch, tmp_path) -> None:
                 "name": None,
                 "tags": [],
                 "log_file_name": "train.log",
+                "log_artifacts": False,
+                "max_artifact_mb": 32,
             },
         }
     )
 
-    checkpoint = train_sft(cfg)
 
-    assert checkpoint.exists()
-    assert (checkpoint / "training_state.pt").exists()
-    assert (checkpoint / "model.pt").exists()
+def _patch_sft(monkeypatch, data):
+    monkeypatch.delenv("SLURM_PROCID", raising=False)
+    monkeypatch.setattr("cot_compression.training.sft.AutoTokenizer", FakeSFTTokenizer)
+    monkeypatch.setattr(
+        "cot_compression.training.sft.AutoModelForCausalLM", TinySFTModel
+    )
+    monkeypatch.setattr(
+        "cot_compression.training.sft.load_tokenized_sft_data", lambda cfg: data
+    )
+
+
+def test_sft_training_runs_and_publishes_a_resumable_checkpoint(
+    monkeypatch, tmp_path
+) -> None:
+    data = DatasetDict(
+        {"train": _tokenized_split(24, seed=0), "eval": _tokenized_split(8, seed=1)}
+    )
+    _patch_sft(monkeypatch, data)
+
+    train_sft(_sft_cfg(tmp_path))
+
+    root = tmp_path / "sft" / "checkpoints"
+    pointer = (root / "LATEST").read_text().strip()
+    assert (root / pointer / "training_state.pt").exists()
+    assert (root / pointer / "model.pt").exists()
+    assert (root / "best" / "model.pt").exists()
+    # best/ is eval-only, so it must NOT carry optimizer state.
+    assert not (root / "best" / "training_state.pt").exists()
+
+
+def _latest_weights(run_root: Path):
+    root = run_root / "sft" / "checkpoints"
+    pointer = (root / "LATEST").read_text().strip()
+    return torch.load(root / pointer / "model.pt", map_location="cpu"), pointer
+
+
+def test_resume_reproduces_an_uninterrupted_run(monkeypatch, tmp_path) -> None:
+    """The point of the plan+pointer design: stopping and resuming must land on
+    bit-identical weights, not merely a plausible continuation."""
+    data = DatasetDict(
+        {"train": _tokenized_split(24, seed=0), "eval": _tokenized_split(8, seed=1)}
+    )
+
+    _patch_sft(monkeypatch, data)
+    train_sft(_sft_cfg(tmp_path / "full"))
+    reference, final_pointer = _latest_weights(tmp_path / "full")
+
+    # Same configuration, cut off after one step, then resumed via the pointer.
+    _patch_sft(monkeypatch, data)
+    train_sft(_sft_cfg(tmp_path / "split", max_steps=1))
+    _patch_sft(monkeypatch, data)
+    train_sft(_sft_cfg(tmp_path / "split"))
+    resumed, resumed_pointer = _latest_weights(tmp_path / "split")
+
+    assert resumed_pointer == final_pointer, "resume ended on a different step"
+    assert set(reference) == set(resumed)
+    for key, value in reference.items():
+        torch.testing.assert_close(value, resumed[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("chunk", [1, 5, 37, 4096])
+def test_chunked_ce_matches_reference_loss_and_gradients(chunk: int) -> None:
+    torch.manual_seed(0)
+    model = TinySFTModel()
+    wrapper = ChunkedCELM(model, chunk_tokens=chunk)
+
+    input_ids = torch.randint(1, 64, (2, 19))
+    labels = input_ids.clone()
+    labels[:, :4] = -100  # prompt region
+    labels[0, 10:13] = -100  # an ignored run inside the supervised region
+    attention_mask = torch.ones_like(input_ids)
+
+    total = wrapper(input_ids, attention_mask, labels)
+    total.backward()
+    chunked_grad = model.lm_head.weight.grad.clone()
+
+    model.zero_grad()
+    hidden = model.model.embed_tokens(input_ids)
+    logits = model.lm_head(hidden[:, :-1])
+    expected = F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)).float(),
+        labels[:, 1:].reshape(-1),
+        ignore_index=-100,
+        reduction="sum",
+    )
+    expected.backward()
+
+    torch.testing.assert_close(total, expected, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(
+        chunked_grad, model.lm_head.weight.grad, rtol=1e-5, atol=1e-5
+    )
+
+
+def test_chunked_ce_handles_a_fully_ignored_chunk() -> None:
+    model = TinySFTModel()
+    wrapper = ChunkedCELM(model, chunk_tokens=4)
+    input_ids = torch.randint(1, 64, (1, 12))
+    labels = torch.full_like(input_ids, -100)
+    labels[0, -2:] = input_ids[0, -2:]
+
+    total = wrapper(input_ids, torch.ones_like(input_ids), labels)
+    total.backward()
+
+    assert torch.isfinite(total)
+    assert torch.isfinite(model.lm_head.weight.grad).all()
+
+
+def test_accumulation_is_token_weighted_not_mean_of_means() -> None:
+    """Micro-batches here are token-budgeted, so they hold different numbers of
+    supervised tokens. Averaging per-micro-batch means (what the loop used to do)
+    silently over-weights short batches."""
+    torch.manual_seed(0)
+    model = TinySFTModel()
+    wrapper = ChunkedCELM(model, chunk_tokens=1024)
+
+    batches = []
+    for supervised in (2, 7, 11):
+        ids = torch.randint(1, 64, (1, 16))
+        labels = torch.full_like(ids, -100)
+        labels[0, -supervised:] = ids[0, -supervised:]
+        batches.append((ids, labels))
+    denom = sum(int((labels[:, 1:] != -100).sum()) for _, labels in batches)
+
+    def grad_of(fn) -> torch.Tensor:
+        model.zero_grad()
+        fn()
+        return model.lm_head.weight.grad.clone()
+
+    accumulated = grad_of(
+        lambda: [
+            (wrapper(ids, torch.ones_like(ids), labels) / denom).backward()
+            for ids, labels in batches
+        ]
+    )
+    joint_ids = torch.cat([ids for ids, _ in batches])
+    joint_labels = torch.cat([labels for _, labels in batches])
+    reference = grad_of(
+        lambda: (
+            wrapper(joint_ids, torch.ones_like(joint_ids), joint_labels) / denom
+        ).backward()
+    )
+    naive = grad_of(
+        lambda: [
+            (
+                wrapper(ids, torch.ones_like(ids), labels)
+                / int((labels[:, 1:] != -100).sum())
+                / len(batches)
+            ).backward()
+            for ids, labels in batches
+        ]
+    )
+
+    torch.testing.assert_close(accumulated, reference, rtol=1e-5, atol=1e-6)
+    assert not torch.allclose(naive, reference, rtol=1e-3, atol=1e-6), (
+        "the naive scheme matched the correct one, so this test proves nothing"
+    )
+
+
+def _plan_cfg(**overrides):
+    return _sft_cfg(Path("/tmp"), **overrides)
+
+
+def test_plan_epoch_is_deterministic_and_ddp_safe() -> None:
+    rng = np.random.default_rng(0)
+    lengths = rng.integers(4, 80, 200)
+    starts = (lengths // 3).astype(np.int64)
+    cfg = _plan_cfg()
+
+    first = plan_epoch(lengths, starts, cfg, epoch=0, world_size=4)
+    again = plan_epoch(lengths, starts, cfg, epoch=0, world_size=4)
+    other = plan_epoch(lengths, starts, cfg, epoch=1, world_size=4)
+
+    assert first.micro == again.micro and first.signature == again.signature
+    assert first.micro != other.micro
+
+    # DDP deadlocks unless every rank runs the same number of micro-batches.
+    assert len(first.micro) % 4 == 0
+    assert all((stop - start) % 4 == 0 for start, stop in first.steps)
+
+    flat = [index for batch in first.micro for index in batch]
+    assert len(flat) == len(set(flat)), "an example appeared twice in one epoch"
+    assert all(lengths[index] <= cfg.training.max_length for index in flat)
+    assert first.dropped == int((lengths > cfg.training.max_length).sum())
+
+
+def test_plan_denominator_is_the_exact_supervised_token_count() -> None:
+    rng = np.random.default_rng(3)
+    lengths = rng.integers(6, 40, 120)
+    starts = (lengths // 4).astype(np.int64)
+    plan = plan_epoch(lengths, starts, _plan_cfg(), epoch=0, world_size=2)
+
+    for (start, stop), denom in zip(plan.steps, plan.denom, strict=True):
+        expected = sum(
+            int(lengths[i] - starts[i]) for b in plan.micro[start:stop] for i in b
+        )
+        assert denom == expected
+
+
+def test_plan_signature_changes_with_the_batching_knobs() -> None:
+    lengths = np.full(64, 10, dtype=np.int64)
+    starts = np.full(64, 2, dtype=np.int64)
+    base = plan_epoch(lengths, starts, _plan_cfg(), epoch=0, world_size=1)
+    wider = plan_epoch(
+        lengths, starts, _plan_cfg(max_batch_tokens=128), epoch=0, world_size=1
+    )
+    assert base.signature != wider.signature
 
 
 def test_answer_loss_evaluation_smoke(monkeypatch, tmp_path) -> None:

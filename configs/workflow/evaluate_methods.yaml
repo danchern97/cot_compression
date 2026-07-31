@@ -11,7 +11,7 @@ defaults:
 mode: evaluate_methods
 
 logging:
-  project: qwen3-answer-loss
+  group: eval
   log_file_name: eval.log
   tags:
     - qwen3

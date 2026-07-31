@@ -7,3 +7,5 @@ train_size: 600000
 eval_size: 20000
 test_size: 100000
 seed: 1337
+# Worker processes for the one-off pre-tokenization pass (CPU partition).
+tokenize_num_proc: 60

@@ -1,7 +1,9 @@
-# Submitit/SLURM launcher for Snellius gpu_h100.
+# Submitit/SLURM launcher for Snellius gpu_h100 -- ONE GPU per job.
 # Use with multirun: python scripts/run.py -m hydra/launcher=snellius_h100 ...
-# The setup: block exports HF_HOME so every job reads/writes the HuggingFace
-# cache on /scratch-shared instead of the quota-limited home directory.
+#
+# This is the launcher for the single-process workflows (eval, precompute). SFT
+# uses snellius_h100_ddp.yaml, which requests one task per GPU; running eval with
+# tasks_per_node > 1 would duplicate the whole job on every rank.
 defaults:
   - submitit_slurm
   - _self_
@@ -15,3 +17,9 @@ nodes: 1
 array_parallelism: 256
 setup:
   - export HF_HOME=/scratch-shared/$USER/huggingface
+  # W&B otherwise stages runs and artifacts under ~/.cache/wandb, i.e. the
+  # 200 GiB HOME quota.
+  - export WANDB_DIR=/scratch-shared/$USER/cot_compression/wandb
+  - export WANDB_CACHE_DIR=/scratch-shared/$USER/cot_compression/wandb/cache
+  - export WANDB_DATA_DIR=/scratch-shared/$USER/cot_compression/wandb/data
+  - export WANDB_ARTIFACT_DIR=/scratch-shared/$USER/cot_compression/wandb/artifacts

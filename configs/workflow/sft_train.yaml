@@ -19,14 +19,39 @@ optim:
   eps: 1e-8
 
 logging:
-  project: qwen3-dolci-sft
+  group: sft
+  # Name the W&B run after the hyperparameters. Left null, W&B invents names like
+  # "copper-dawn-3", and a 6-arm sweep becomes six runs you cannot tell apart
+  # without opening each one's config. Set here rather than in logging/wandb.yaml
+  # because run_name only exists in this workflow.
+  name: ${run_name}
   tags:
     - qwen3-4b
     - dolci
     - sft
 
+# Interpolates from the swept values, so each sweep arm gets its own stable
+# directory. Deliberately contains no ${now:}: the run dir must be identical
+# across a resume, which is what lets submitit requeue the same command line and
+# lets resume_from_checkpoint=auto find checkpoints/LATEST.
+#
+# run_tag separates campaigns that would otherwise collide. A sweep arm at
+# lr=1e-5/gb=64 and the full run at lr=1e-5/gb=64 produce identical hyperparameter
+# strings, so without the tag the full run would silently resume from the sweep
+# arm's 265-step checkpoint instead of starting fresh.
+run_tag: full
+run_name: ${run_tag}_lr${optim.lr}_gb${training.target_global_batch}
+
+paths:
+  run_dir: ${paths.output_dir}/runs/sft/${data.name}/${run_name}
+
 hydra:
   run:
-    dir: ${paths.output_dir}/runs/sft/${data.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ${paths.run_dir}
+  sweep:
+    dir: ${paths.run_dir}
+    subdir: .
   job:
-    chdir: true
+    # False: the run dir is passed explicitly via paths.run_dir, and under DDP
+    # four ranks chdir'ing into one directory buys nothing.
+    chdir: false

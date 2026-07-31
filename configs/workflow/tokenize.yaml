@@ -1,0 +1,25 @@
+# @package _global_
+
+# Pre-tokenize the SFT splits once, to disk. CPU-only -- submit to `rome`/`genoa`
+# (1 SBU/core-hour), not to a GPU node. Kept separate from sft_train because
+# under tasks_per_node=4 four ranks would race on the same cache directory and
+# each fork `data.tokenize_num_proc` workers onto a GPU node.
+
+defaults:
+  - /paths: default
+  - /data: dolci_think_sft_7b_600k
+  - /method: qwen3/4b
+  - /logging: wandb
+  - _self_
+
+mode: tokenize
+
+logging:
+  enabled: false
+  log_file_name: tokenize.log
+
+hydra:
+  run:
+    dir: ${paths.light_dir}/tokenize/${data.name}/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: false

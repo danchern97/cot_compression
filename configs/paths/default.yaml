@@ -1,5 +1,18 @@
 project_root: ${hydra:runtime.cwd}
-output_dir: ${paths.project_root}/outputs
-data_dir: ${paths.project_root}/data
+
+# Two tiers, because HOME is a hard 200 GiB quota and a single SFT checkpoint is
+# ~48 GB.
+#
+# Heavy + regenerable -> /scratch-shared. Purged after 14 days without a content
+# change; scripts/scratch_keepalive.sh holds it open on a 7-day cycle.
+scratch_dir: /scratch-shared/${oc.env:USER}/cot_compression
+output_dir: ${paths.scratch_dir}/outputs
+tokenized_dir: ${paths.scratch_dir}/tokenized
+data_dir: ${paths.scratch_dir}/data
+
+# Light + durable -> HOME. KB-scale per run (resolved config, log, summary,
+# metric curves, benchmark tables); these must survive a scratch purge.
+light_dir: ${paths.project_root}/results
 reports_dir: ${paths.project_root}/reports
+
 run_dir: null

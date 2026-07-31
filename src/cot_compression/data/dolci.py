@@ -1,13 +1,34 @@
 from __future__ import annotations
 
+import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from datasets import (
+    Dataset,
+    DatasetDict,
+    Features,
+    Sequence,
+    Value,
+    load_dataset,
+    load_from_disk,
+)
 from omegaconf import DictConfig
 
 Message = dict[str, str]
+
+# int32, not the datasets default int64: the train split is ~6.3e9 tokens, so
+# the width choice is the difference between a 25 GB and a 50 GB cache.
+TOKENIZED_FEATURES = Features(
+    {
+        "input_ids": Sequence(Value("int32")),
+        "label_start": Value("int32"),
+        "length": Value("int32"),
+        "id": Value("string"),
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -142,3 +163,98 @@ def load_dolci_sft_data(cfg: DictConfig) -> DolciSFTData:
         eval=dataset_dict["eval"],
         test=dataset_dict["test"],
     )
+
+
+def tokenized_dir(cfg: DictConfig) -> Path:
+    """Cache location, keyed by dataset *and* model.
+
+    The label boundary is produced by the model's chat template, so a cache built
+    with one tokenizer is meaningless for another. Keying on the model slug makes
+    a mismatch impossible rather than merely unlikely.
+    """
+    slug = str(cfg.method.model_name).replace("/", "__")
+    return Path(cfg.paths.tokenized_dir) / str(cfg.data.name) / slug
+
+
+def _tokenize_row(example: dict[str, Any], tokenizer: Any) -> dict[str, Any]:
+    from cot_compression.data.chat import tokenize_chat_for_sft
+
+    try:
+        chat = tokenize_chat_for_sft(tokenizer, example["messages"])
+    except ValueError:
+        # Filtered out below. Rows reach here only if the template boundary check
+        # fails or the supervised turn is empty, both of which are data faults.
+        return {"input_ids": [], "label_start": 0, "length": 0, "id": example["id"]}
+    return {
+        "input_ids": chat.input_ids,
+        "label_start": chat.label_start,
+        "length": len(chat.input_ids),
+        "id": example["id"],
+    }
+
+
+def build_tokenized_sft_data(cfg: DictConfig) -> Path:
+    """Pre-tokenize train+eval once, to disk.
+
+    Not a throughput optimization -- 37 examples/s/proc already outruns four
+    H100s. It exists so every sequence length is known *before* training, which
+    is what makes length-bucketed batching, deterministic drop-of-overlong-rows
+    and an exact `total_steps` (hence a resumable LR schedule) possible.
+
+    Deliberately a separate workflow rather than lazy work inside the SFT path:
+    under `tasks_per_node=4` four ranks would race on the same cache and each
+    fork `num_proc` workers on a GPU node.
+
+    No length filtering here -- `training.max_length` stays a training-time knob,
+    so changing it does not invalidate the cache.
+    """
+    from transformers import AutoTokenizer
+
+    out = tokenized_dir(cfg)
+    if out.exists():
+        return out
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(cfg.method.model_name),
+        use_fast=bool(cfg.method.use_fast_tokenizer),
+        trust_remote_code=bool(cfg.method.trust_remote_code),
+    )
+    raw = load_dolci_sft_data(cfg)
+    source = DatasetDict({"train": raw.train, "eval": raw.eval})
+    tokenized = source.map(
+        _tokenize_row,
+        fn_kwargs={"tokenizer": tokenizer},
+        remove_columns=source["train"].column_names,
+        features=TOKENIZED_FEATURES,
+        num_proc=int(cfg.data.tokenize_num_proc),
+        # Rows average ~10.5k tokens and are buffered as Python ints before the
+        # arrow flush, so the default batch of 1000 would hold ~300 MB per worker
+        # -- times 60 workers, enough to matter.
+        writer_batch_size=200,
+        desc="Tokenizing Dolci for SFT",
+    ).filter(
+        lambda example: example["length"] > 0,
+        num_proc=int(cfg.data.tokenize_num_proc),
+        desc="Dropping rows that failed the template boundary check",
+    )
+
+    staging = out.with_name(out.name + ".tmp")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    tokenized.save_to_disk(str(staging))
+    os.replace(staging, out)
+    return out
+
+
+def load_tokenized_sft_data(cfg: DictConfig) -> DatasetDict:
+    out = tokenized_dir(cfg)
+    if not out.exists():
+        raise FileNotFoundError(
+            f"No pre-tokenized cache at {out}. Build it once with:\n"
+            f"  uv run python scripts/run.py tokenize "
+            f"data={cfg.data.name} method={cfg.method.model_name}"
+        )
+    loaded = load_from_disk(str(out))
+    if not isinstance(loaded, DatasetDict):
+        raise ValueError(f"Expected a DatasetDict at {out}.")
+    return loaded

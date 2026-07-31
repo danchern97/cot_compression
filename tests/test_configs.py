@@ -31,7 +31,25 @@ def test_hydra_configs_compose() -> None:
     assert sft_cfg.data.name == "dolci_think_sft_7b_600k"
     assert sft_cfg.data.eval_size == 20000
     assert sft_cfg.data.test_size == 100000
-    assert sft_cfg.training.torch_dtype == "bfloat16"
+    # fp32 master weights: bf16 params would put the AdamW moments in bf16 too and
+    # updates at lr 1e-5 would round away.
+    assert sft_cfg.training.torch_dtype == "float32"
+    assert sft_cfg.training.autocast_dtype == "bfloat16"
+    assert sft_cfg.training.attn_implementation == "sdpa"
+    # Rows are dropped, never truncated, at the full model context.
+    assert sft_cfg.training.max_length == 32768
+    assert sft_cfg.training.max_batch_tokens >= sft_cfg.training.max_length
+    assert sft_cfg.training.target_global_batch == 32
+    assert sft_cfg.training.resume_from_checkpoint == "auto"
+    assert sft_cfg.training.max_steps is None
+    # Heavy artifacts on scratch, light ones on HOME (200 GiB quota).
+    assert sft_cfg.paths.output_dir.startswith("/scratch-shared/")
+    assert sft_cfg.paths.tokenized_dir.startswith("/scratch-shared/")
+    assert sft_cfg.paths.data_dir.startswith("/scratch-shared/")
+    # W&B: one project, and artifact uploads off by default (tokens.jsonl is GBs).
+    assert sft_cfg.logging.entity == "cot-compression"
+    assert sft_cfg.logging.project == "cot-compression-qwen3"
+    assert sft_cfg.logging.log_artifacts is False
     assert eval_cfg.mode == "evaluate_methods"
     assert eval_cfg.method.model_name == "Qwen/Qwen3-4B"
     assert eval_cfg.evaluation.max_length is None

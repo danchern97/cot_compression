@@ -12,6 +12,7 @@ __pycache__/
 # Research outputs
 outputs/
 reports/
+results/
 wandb/
 one-off/
 multirun/

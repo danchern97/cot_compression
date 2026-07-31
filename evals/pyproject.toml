@@ -1,0 +1,23 @@
+[project]
+name = "cot-compression-evals"
+version = "0.1.0"
+description = "Downstream benchmark harness (lm-evaluation-harness + vLLM), isolated from the training environment."
+requires-python = ">=3.11"
+
+# Deliberately a SEPARATE uv project with its own lockfile and .venv.
+#
+# vllm 0.26.0 hard-pins torch==2.11.0, while the training project runs
+# torch 2.12.1+cu130. Adding lm-eval[vllm] to the root project would resolve by
+# downgrading torch there, silently changing the environment that produced every
+# existing result and that the SFT run depends on.
+#
+# Invoke with:  uv run --project evals lm_eval ...
+# The two environments share nothing but the HuggingFace cache on scratch.
+#
+# The `math` extra pulls sympy + math_verify + antlr4, which MATH-500 and AIME
+# need for answer-equivalence checking.
+dependencies = [
+    "lm-eval[math,vllm]==0.4.12",
+    "vllm==0.26.0",
+    "ray>=2.9",
+]

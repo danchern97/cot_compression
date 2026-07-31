@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import re
+
+import pytest
+
 from cot_compression.data.answers import (
     extract_answer_trace,
     find_answer_span,
@@ -7,8 +11,9 @@ from cot_compression.data.answers import (
 )
 from cot_compression.data.chat import (
     IGNORE_INDEX,
-    QwenChatSFTCollator,
-    find_assistant_spans,
+    build_labels,
+    pad_collate,
+    supervised_turn_index,
     tokenize_chat_for_sft,
 )
 from cot_compression.data.dolci import (
@@ -17,8 +22,21 @@ from cot_compression.data.dolci import (
     validate_messages,
 )
 
+THINK_BLOCK = re.compile(r"<think>\s*(.*?)\s*</think>\s*", re.DOTALL)
+
 
 class FakeChatTokenizer:
+    """Char-level tokenizer whose chat template reproduces Qwen3's two rewrites.
+
+    Both are load-bearing and both broke the previous span-search labelling:
+
+    1. Whitespace inside the supervised turn's ``<think>`` block is normalized,
+       so the raw message content is *not* a substring of the render.
+    2. Assistant turns at or before the final user message have their reasoning
+       stripped entirely (``content.split('</think>')[-1]``), so a re-render of a
+       message prefix is not a prefix of the full render for those turns.
+    """
+
     eos_token = "<eos>"
 
     def __init__(self) -> None:
@@ -37,28 +55,43 @@ class FakeChatTokenizer:
     def apply_chat_template(
         self,
         messages,
-        tokenize: bool,
-        add_generation_prompt: bool,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
     ) -> str:
         assert not tokenize
-        assert not add_generation_prompt
-        return "".join(
-            f"<|{message['role']}|>\n{message['content']}\n" for message in messages
+        last_user = max(
+            (i for i, m in enumerate(messages) if m["role"] == "user"), default=-1
         )
+        parts = []
+        for index, message in enumerate(messages):
+            content = message["content"]
+            if message["role"] == "assistant":
+                if index > last_user:
+                    content = THINK_BLOCK.sub(
+                        lambda m: f"<think>\n{m.group(1)}\n</think>\n\n", content
+                    )
+                else:
+                    content = content.split("</think>")[-1]
+            parts.append(f"<|im_start|>{message['role']}\n{content}<|im_end|>\n")
+        if add_generation_prompt:
+            parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
 
     def __call__(
         self,
         text: str,
-        add_special_tokens: bool,
-        max_length: int,
-        truncation: bool,
-        return_offsets_mapping: bool,
+        add_special_tokens: bool = False,
+        max_length: int | None = None,
+        truncation: bool = False,
+        return_offsets_mapping: bool = False,
     ):
         assert not add_special_tokens
-        assert truncation
-        assert return_offsets_mapping
-        start = max(0, len(text) - max_length) if self.truncation_side == "left" else 0
-        text = text[start : start + max_length]
+        start = 0
+        if truncation and max_length is not None:
+            start = (
+                max(0, len(text) - max_length) if self.truncation_side == "left" else 0
+            )
+            text = text[start : start + max_length]
         input_ids = []
         offsets = []
         index = 0
@@ -134,51 +167,108 @@ def test_invalid_dolci_messages_can_be_filtered() -> None:
     assert not has_valid_messages({"messages": [{"role": "assistant", "content": ""}]})
 
 
-def test_chat_tokenization_masks_non_assistant_tokens() -> None:
+def test_labels_survive_template_think_rewrite() -> None:
+    """The regression that broke 448/500 real rows: the old span search looked for
+    the raw content in the render, but the template rewrites the think block."""
     tokenizer = FakeChatTokenizer()
     messages = [
         {"role": "user", "content": "Question"},
         {"role": "assistant", "content": "<think>Trace</think>\nAnswer"},
     ]
+    rendered = tokenizer.apply_chat_template(messages)
+    assert messages[1]["content"] not in rendered  # the exact condition that failed
+    assert "<think>\nTrace\n</think>" in rendered
 
-    tokenized = tokenize_chat_for_sft(
-        tokenizer=tokenizer,
-        messages=messages,
-        max_length=128,
-    )
-    rendered = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-    assistant_start, assistant_end = find_assistant_spans(messages, rendered)[0]
+    chat = tokenize_chat_for_sft(tokenizer, messages)
+    labels = build_labels(chat.input_ids, chat.label_start)
 
-    assert tokenized.labels[rendered.index("Question")] == IGNORE_INDEX
-    assert tokenized.labels[assistant_start] == tokenized.input_ids[assistant_start]
-    assert tokenized.labels[assistant_end - 1] == tokenized.input_ids[assistant_end - 1]
+    # The fake emits one token per character, so token indices are char indices.
+    prompt = tokenizer.apply_chat_template(messages[:1], add_generation_prompt=True)
+    assert chat.label_start == len(prompt)
+    assert set(labels[: chat.label_start]) == {IGNORE_INDEX}
+    assert labels[chat.label_start :] == chat.input_ids[chat.label_start :]
+
+    supervised = rendered[chat.label_start :]
+    assert supervised.startswith("<think>\nTrace")
+    assert supervised.endswith("<|im_end|>\n"), "im_end must be supervised"
 
 
-def test_chat_collator_masks_padding() -> None:
-    collator = QwenChatSFTCollator(tokenizer=FakeChatTokenizer(), max_length=128)
-    batch = collator(
+def test_multi_turn_supervises_only_the_final_assistant_turn() -> None:
+    """Earlier assistant turns are rendered think-stripped, so supervising them
+    would teach the model to answer without reasoning."""
+    tokenizer = FakeChatTokenizer()
+    messages = [
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "<think>Hidden</think>\nEarly"},
+        {"role": "user", "content": "Second"},
+        {"role": "assistant", "content": "<think>Shown</think>\nLate"},
+    ]
+    rendered = tokenizer.apply_chat_template(messages)
+    assert "Hidden" not in rendered and "Shown" in rendered
+
+    assert supervised_turn_index(messages) == 3
+    chat = tokenize_chat_for_sft(tokenizer, messages)
+    supervised = rendered[chat.label_start :]
+    assert "Late" in supervised
+    assert "Early" not in supervised
+
+
+def test_tokenize_chat_rejects_a_broken_prefix_boundary() -> None:
+    """A template that rewrites *earlier* turns breaks the prefix property; that
+    must raise rather than silently misalign every label."""
+
+    class DriftingTokenizer(FakeChatTokenizer):
+        """Rewrites an earlier turn in the full render only, so the generation
+        prompt is no longer a prefix of it."""
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=False
+        ) -> str:
+            text = super().apply_chat_template(
+                messages, tokenize, add_generation_prompt
+            )
+            return text if add_generation_prompt else text.replace("Question", "Q")
+
+    messages = [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "<think>Trace</think>\nAnswer"},
+    ]
+    tokenize_chat_for_sft(FakeChatTokenizer(), messages)  # sanity: honest one passes
+
+    with pytest.raises(ValueError, match="token prefix"):
+        tokenize_chat_for_sft(DriftingTokenizer(), messages)
+
+
+def test_supervised_turn_index_requires_a_trailing_assistant_turn() -> None:
+    with pytest.raises(ValueError, match="No assistant turn"):
+        supervised_turn_index(
+            [
+                {"role": "user", "content": "First"},
+                {"role": "assistant", "content": "Reply"},
+                {"role": "user", "content": "Dangling"},
+            ]
+        )
+
+
+def test_pad_collate_masks_padding() -> None:
+    batch = pad_collate(
         [
-            {
-                "messages": [
-                    {"role": "user", "content": "Question"},
-                    {"role": "assistant", "content": "Answer"},
-                ]
-            },
-            {
-                "messages": [
-                    {"role": "user", "content": "Longer question"},
-                    {"role": "assistant", "content": "Longer answer"},
-                ]
-            },
-        ]
+            {"input_ids": [5, 6, 7], "label_start": 1},
+            {"input_ids": [5, 6, 7, 8, 9], "label_start": 2},
+        ],
+        pad_token_id=0,
     )
 
-    assert batch["input_ids"].shape[0] == 2
+    assert batch["input_ids"].shape == (2, 5)
     assert (batch["labels"][batch["attention_mask"] == 0] == IGNORE_INDEX).all()
+    assert batch["labels"][0].tolist() == [
+        IGNORE_INDEX,
+        6,
+        7,
+        IGNORE_INDEX,
+        IGNORE_INDEX,
+    ]
+    assert batch["labels"][1].tolist() == [IGNORE_INDEX, IGNORE_INDEX, 7, 8, 9]
 
 
 def test_extract_answer_trace() -> None:

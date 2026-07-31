@@ -1,0 +1,46 @@
+# Submitit/SLURM launcher for Snellius gpu_h100 -- a full node, 4-way DDP.
+# Use with multirun: python scripts/run.py -m hydra/launcher=snellius_h100_ddp sft ...
+#
+# tasks_per_node == gpus_per_node: submitit emits `srun --ntasks-per-node=4`, so
+# every rank is a real SLURM task and torch reads its rank straight from
+# SLURM_PROCID -- no torchrun layer. All four ranks execute the same Hydra job in
+# the same run dir, so logging, config dumping and checkpoint writes are rank-0
+# gated in the training code.
+#
+# Billing is MAX over TRES, so a 4-GPU node costs 768 SBU/h -- the same 192
+# SBU/h per GPU as a quarter node. Multi-GPU buys wall-clock, not budget.
+defaults:
+  - submitit_slurm
+  - _self_
+
+partition: gpu_h100
+# NOT the 5-day partition maximum. Snellius refuses a job whose *estimated
+# maximum* cost (walltime x billing rate) exceeds the remaining budget, and a
+# 4-GPU job bills 768 SBU/h -- so timeout_min=7200 estimates 92,160 SBU and is
+# rejected outright ("CANCELLED by 0", one second, no output) even though the
+# job would really use a fraction of that. Keep the default small enough for any
+# short job to dispatch; long runs raise it explicitly and lean on requeue:
+#   sweep arm  hydra.launcher.timeout_min=240   ->  3,072 SBU estimated
+#   full run   hydra.launcher.timeout_min=2880  -> 36,864 SBU estimated
+timeout_min: 240
+cpus_per_task: 16          # 64 cores / 4 tasks
+gpus_per_node: 4
+tasks_per_node: 4
+nodes: 1
+mem_gb: 700
+# Requeue after a timeout. Safe only because paths.run_dir contains no ${now:}
+# and resume_from_checkpoint=auto follows checkpoints/LATEST, so the requeued job
+# runs the identical command line and picks up where it stopped.
+max_num_timeout: 5
+array_parallelism: 256
+setup:
+  - export HF_HOME=/scratch-shared/$USER/huggingface
+  # Micro-batch shapes change every step; without expandable segments the caching
+  # allocator fragments badly at 32k-token sequences.
+  - export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  - export OMP_NUM_THREADS=4
+  - export TOKENIZERS_PARALLELISM=false
+  - export WANDB_DIR=/scratch-shared/$USER/cot_compression/wandb
+  - export WANDB_CACHE_DIR=/scratch-shared/$USER/cot_compression/wandb/cache
+  - export WANDB_DATA_DIR=/scratch-shared/$USER/cot_compression/wandb/data
+  - export WANDB_ARTIFACT_DIR=/scratch-shared/$USER/cot_compression/wandb/artifacts

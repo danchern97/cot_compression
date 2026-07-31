@@ -1,9 +1,16 @@
 enabled: true
-mode: offline
-project: cot-compression
-entity: null
+mode: online
+entity: cot-compression
+project: cot-compression-qwen3
 group: null
 name: null
 tags:
-  - tiny-gpt
+  - qwen3
 log_file_name: train.log
+
+# Artifact uploads are OFF by default and size-capped even when enabled.
+# The eval path calls log_artifact on tokens.jsonl, whose files run 0.6-4.1 GB
+# here; one 27-cell sweep would push ~80 GB into a 200 GB W&B quota. Scalars are
+# ~10 MB per run, so metrics are never the problem -- artifacts are.
+log_artifacts: false
+max_artifact_mb: 32

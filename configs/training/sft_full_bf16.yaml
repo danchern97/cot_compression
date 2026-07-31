@@ -1,19 +1,77 @@
 seed: 1337
 device: auto
 deterministic: false
-torch_dtype: bfloat16
+
+# fp32 master weights + bf16 autocast compute. Loading the model in bf16 and
+# handing it to plain AdamW does not train: the moments land in bf16 too, and at
+# lr 1e-5 against a weight scale of ~1e-2 the relative update (~5e-4) is below
+# bf16's ~4e-3 mantissa step, so updates round away.
+torch_dtype: float32
+autocast_dtype: bfloat16
+# flash-attn has no cu13/torch-2.12 wheel; sdpa on H100 dispatches to the
+# FlashAttention-2 / cuDNN fused kernel anyway.
+attn_implementation: sdpa
+
 num_train_epochs: 1
+max_train_examples: null
+# Absolute ceiling on optimizer steps for THIS job. Unlike max_train_examples it
+# does not change the batch plan, so a run stopped here resumes onto exactly the
+# curriculum it would have had. Used by the throughput gate and by resume tests.
 max_steps: null
-batch_size: 1
-eval_batch_size: 1
-gradient_accumulation_steps: 16
-max_length: 4096
+
+# Rows longer than max_length are DROPPED, never truncated: the mean Dolci row is
+# 10.5k tokens, so left truncation would delete the question from most of them
+# and right truncation would delete the answer.
+max_length: 32768
+# Must be >= max_length -- a single max_length row always forms a micro-batch of
+# one, so max_length is what actually sets the memory ceiling.
+max_batch_tokens: 32768
+# Rows are length-sorted inside a group before batching; bigger groups mean less
+# padding but a coarser shuffle.
+length_group_size: 8192
+micro_batch_max_sequences: 16
+# Sequences per optimizer step, summed across ranks. Accumulation runs until this
+# is reached, so gradient_accumulation_steps is derived, not configured.
+#
+# 32 comes from the Phase 3 sweep: at equal data gb=32 beat gb=128 for every
+# learning rate tried (0.877-0.880 vs 0.889-0.897 eval loss). ~404k supervised
+# tokens per step, 14,759 steps for one epoch.
+target_global_batch: 32
+
+# lm_head + cross-entropy run in slices this wide, keeping peak loss memory at
+# O(chunk x vocab) instead of materializing fp32 logits for the whole batch.
+ce_chunk_tokens: 1024
+
+# Per-micro-batch shape + memory logging. Off by default; the OOM annotation
+# on the training step is always on.
+debug_memory: false
+
+num_workers: 8
+prefetch_factor: 4
+
 warmup_ratio: 0.03
-eval_interval: 100
-eval_iters: 50
-checkpoint_interval: 500
-log_interval: 10
+# A pure ratio gives ~3 warmup steps on a short sweep arm, which is no warmup at
+# all and would confound the LR comparison.
+min_warmup_steps: 20
+# Null => the cosine spans this run's own steps. The sweep sets it to the full
+# run's step count so each arm is judged on the LR trajectory it would really see.
+schedule_horizon_steps: null
 gradient_clip: 1.0
 gradient_checkpointing: true
 compile: false
-resume_from_checkpoint: null
+
+eval_interval: 100
+# Fixed, seed-shuffled slice of the eval split. Scoring the full 20k split costs
+# ~2 GPU-h per evaluation; 512 rows costs ~0.05 and is the same rows every time.
+eval_examples: 512
+log_interval: 10
+
+# Wall-clock, not steps: step cost varies ~4x across the batch sizes we sweep.
+checkpoint_minutes: 30
+# How many full (resumable, ~48 GB) checkpoints to retain. 0 means the run writes
+# none at all and cannot be resumed -- correct for short sweep arms, never for the
+# full run.
+keep_checkpoints: 2
+# auto => follow checkpoints/LATEST, cold start if absent. Lets submitit requeue
+# the identical command line after a timeout.
+resume_from_checkpoint: auto
