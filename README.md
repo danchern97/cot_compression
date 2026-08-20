@@ -119,6 +119,18 @@ uv run ruff format --check .
 uv run ty check
 ```
 
+Generate four reproducible Qwen thinking rollouts for each eligible math and
+short-answer QA prompt in `allenai/Dolci-Think-RL-7B`:
+
+```bash
+uv sync --project evals --group dev
+uv run --project evals python evals/generate_traces.py generate
+```
+
+See [evals/TRACE_GENERATION.md](evals/TRACE_GENERATION.md) for filtering,
+sharding, resume, smoke-run, and artifact details. This pipeline is standalone;
+it does not replace the SFT or compression-evaluation data paths.
+
 ## Configuration
 
 Hydra configs live under `configs/`. Override values from the command line:
