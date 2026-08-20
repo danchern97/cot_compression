@@ -1,0 +1,37 @@
+# AIME 2025 (Part I + II, 30 questions), 0-shot, boxed answer, avg@16.
+# A 16-repeat variant of cotc_aime25, everything else identical. Used for the
+# Qwen3-0.6B run; cotc_aime25 stays at the report's 64 repeats so the Qwen3-4B
+# baseline in results/benchmarks/qwen3-4b-raw/ remains reproducible byte for
+# byte. Generation noise is ~+-1.7 pp here at p~=0.2 against ~+-0.8 pp at 64,
+# so the two models' AIME cells are NOT the same protocol -- summarize.py
+# labels them separately.
+tag: cotc_bench
+task: cotc_aime25_16
+dataset_path: math-ai/aime25
+output_type: generate_until
+training_split: null
+validation_split: null
+test_split: test
+doc_to_text: "{{problem}}\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+doc_to_target: "{{answer}}"
+process_results: !function utils.aime_process_results
+num_fewshot: 0
+repeats: 16
+filter_list:
+  - name: avg@16
+    filter:
+      - function: take_first_k
+        k: 16
+generation_kwargs:
+  do_sample: true
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  max_gen_toks: 38912
+  until: []
+metric_list:
+  - metric: math_verify
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

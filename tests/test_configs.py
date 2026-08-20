@@ -24,6 +24,10 @@ def test_hydra_configs_compose() -> None:
                 "logging.enabled=false",
             ],
         )
+        sft_06b_cfg = compose(
+            config_name="run",
+            overrides=["workflow=sft_train_06b", "logging.enabled=false"],
+        )
 
     assert sft_cfg.mode == "sft_train"
     assert sft_cfg.method.model_name == "Qwen/Qwen3-4B"
@@ -64,3 +68,34 @@ def test_hydra_configs_compose() -> None:
     assert eval_cfg.evaluation.scratch_dir is None
     assert eval_32b_cfg.data.source_name == "allenai/Dolci-Think-SFT-32B"
     assert eval_32b_cfg.data.name == "dolci_think_sft_32b_600k"
+
+    # The 0.6B campaign: same dispatch and dataset, different model.
+    assert sft_06b_cfg.mode == "sft_train"
+    assert sft_06b_cfg.method.model_name == "Qwen/Qwen3-0.6B"
+    assert sft_06b_cfg.data.name == sft_cfg.data.name
+    # Checkpointing stays ON. The probe measured 82.8-88.0 GiB (89-94% of a 93 GiB
+    # card) without it at the real 32,768-token micro-batch, against 20.5 with.
+    # Pinned so the ~30% it costs is never quietly "optimized" away again.
+    assert sft_06b_cfg.training.gradient_checkpointing is True
+    assert sft_06b_cfg.training.ce_chunk_tokens == 4096
+    assert sft_06b_cfg.training.checkpoint_minutes == 45
+    # Inherited from sft_full_bf16 and load-bearing: fp32 masters, no truncation.
+    assert sft_06b_cfg.training.torch_dtype == "float32"
+    assert sft_06b_cfg.training.autocast_dtype == "bfloat16"
+    assert sft_06b_cfg.training.resume_from_checkpoint == "auto"
+    # Everything plan_signature covers must match the 4B run, so the two walk the
+    # identical curriculum and their eval losses are comparable.
+    for knob in (
+        "seed",
+        "max_length",
+        "max_batch_tokens",
+        "micro_batch_max_sequences",
+        "length_group_size",
+        "eval_examples",
+    ):
+        assert sft_06b_cfg.training[knob] == sft_cfg.training[knob], knob
+    # run_name is the run directory AND the W&B run id, and carries no model
+    # identifier -- so the 0.6B campaign must not default to the 4B's run_tag.
+    assert sft_06b_cfg.run_tag == "qwen3-0.6b"
+    assert sft_06b_cfg.run_tag != sft_cfg.run_tag
+    assert sft_06b_cfg.paths.run_dir != sft_cfg.paths.run_dir

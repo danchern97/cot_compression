@@ -1,0 +1,35 @@
+# AIME 2025 (Part I + II, 30 questions), 0-shot, boxed answer, avg@64.
+# Qwen3 Technical Report: "For each question, we sample 64 times and take the
+# average accuracy as the final score", and the max output length is raised from
+# 32,768 to 38,912 for AIME'24/'25 "to provide sufficient thinking space".
+# One sample over 30 questions would carry ~+-8.7 pp of noise.
+tag: cotc_bench
+task: cotc_aime25
+dataset_path: math-ai/aime25
+output_type: generate_until
+training_split: null
+validation_split: null
+test_split: test
+doc_to_text: "{{problem}}\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+doc_to_target: "{{answer}}"
+process_results: !function utils.aime_process_results
+num_fewshot: 0
+repeats: 64
+filter_list:
+  - name: avg@64
+    filter:
+      - function: take_first_k
+        k: 64
+generation_kwargs:
+  do_sample: true
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  max_gen_toks: 38912
+  until: []
+metric_list:
+  - metric: math_verify
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

@@ -1,0 +1,39 @@
+# GPQA-Diamond (198 questions), 0-shot CoT, avg@10.
+# Prompt and answer regex are openai/simple-evals verbatim -- the implementation
+# behind the GPQA numbers in most model cards. lm-eval's own gpqa tasks are not
+# used: their prompt requests no answer format at all, yet their `strict-match`
+# filter greps for "The answer is ", so that filter reports a meaningless 0.
+# Qwen3 Technical Report: "For GPQA-Diamond, we sample 10 times for each query
+# and report the averaged accuracy."
+tag: cotc_bench
+task: cotc_gpqa_diamond
+dataset_path: Idavidrein/gpqa
+dataset_name: gpqa_diamond
+output_type: generate_until
+process_docs: !function utils.gpqa_process_docs
+training_split: train
+validation_split: train # the HF dataset only ships a train split
+test_split: null
+doc_to_text: !function utils.gpqa_doc_to_text
+doc_to_target: "{{answer}}"
+process_results: !function utils.gpqa_process_results
+num_fewshot: 0
+repeats: 10
+filter_list:
+  - name: avg@10
+    filter:
+      - function: take_first_k
+        k: 10
+generation_kwargs:
+  do_sample: true
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  max_gen_toks: 32768
+  until: []
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

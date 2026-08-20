@@ -313,11 +313,76 @@ class ChunkedCELM(torch.nn.Module):
         return total
 
 
+# The fields that make a checkpoint a *different model* rather than a later step
+# of the same one. Compared, not hashed, so the error can name what moved.
+_ARCHITECTURE_FIELDS = (
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "intermediate_size",
+    "vocab_size",
+)
+
+
+def check_checkpoint_architecture(cfg: DictConfig, weights_dir: Path) -> None:
+    """Refuse a resume whose checkpoint is a different model than the config asks for.
+
+    `run_name` -- which is both the run directory and the W&B run id -- is built
+    from run_tag, lr and global batch, with no model identifier. So two campaigns
+    on different models can resolve to the same directory, and
+    `resume_from_checkpoint=auto` would then load that directory's checkpoint via
+    `from_pretrained`, which reads the *checkpoint's own* config.json. The result
+    is a job that silently trains the wrong model.
+
+    `plan_signature` cannot catch this. It hashes the batch plan -- seed, world
+    size, batching knobs, row count, total length -- and Qwen3-0.6B and Qwen3-4B
+    ship byte-identical tokenizers, so they share one tokenized cache and produce
+    an identical hash. This check is the only thing standing between a forgotten
+    `run_tag` and a destroyed run.
+    """
+    from transformers import AutoConfig
+
+    # Only a checkpoint that declares an architecture can be checked against one.
+    # `save_pretrained` always writes config.json, so in a real run this is always
+    # present; its absence means the directory was not written by the HF path at
+    # all (the fake models in the tests), and there is nothing to compare.
+    if not (weights_dir / "config.json").exists():
+        return
+
+    want = AutoConfig.from_pretrained(
+        str(cfg.method.model_name),
+        trust_remote_code=bool(cfg.method.trust_remote_code),
+    )
+    found = AutoConfig.from_pretrained(
+        str(weights_dir),
+        trust_remote_code=bool(cfg.method.trust_remote_code),
+    )
+    moved = [
+        f"{field}: checkpoint has {getattr(found, field, None)}, "
+        f"{cfg.method.model_name} has {getattr(want, field, None)}"
+        for field in _ARCHITECTURE_FIELDS
+        if getattr(found, field, None) != getattr(want, field, None)
+    ]
+    if moved:
+        raise ValueError(
+            f"Refusing to resume: {weights_dir} holds a different model than "
+            f"method.model_name={cfg.method.model_name}.\n  "
+            + "\n  ".join(moved)
+            + "\nThis usually means two campaigns share a run_dir because run_name "
+            "(run_tag + lr + global batch) carries no model identifier. Give this "
+            "run its own run_tag."
+        )
+
+
 def build_sft_model_and_tokenizer(
     cfg: DictConfig,
     device: torch.device,
     weights_dir: Path | None,
 ) -> tuple[Any, Any]:
+    if weights_dir is not None:
+        check_checkpoint_architecture(cfg, weights_dir)
+
     tokenizer = cast(
         Any,
         AutoTokenizer.from_pretrained(

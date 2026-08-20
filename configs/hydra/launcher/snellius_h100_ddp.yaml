@@ -40,6 +40,15 @@ setup:
   - export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   - export OMP_NUM_THREADS=4
   - export TOKENIZERS_PARALLELISM=false
+  # The Qwen3-4B run died twice on a 30-minute NCCL ALLREDUCE watchdog timeout
+  # and the root cause was never found, because FlightRecorder was off and the
+  # only evidence was the watchdog message itself. These three cost nothing at
+  # runtime (a 2000-entry ring buffer per rank) and turn a repeat into a dump
+  # naming the collective every rank was stuck in.
+  - export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+  - export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+  - mkdir -p /scratch-shared/$USER/cot_compression/nccl_trace
+  - export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=/scratch-shared/$USER/cot_compression/nccl_trace/dump
   - export WANDB_DIR=/scratch-shared/$USER/cot_compression/wandb
   - export WANDB_CACHE_DIR=/scratch-shared/$USER/cot_compression/wandb/cache
   - export WANDB_DATA_DIR=/scratch-shared/$USER/cot_compression/wandb/data

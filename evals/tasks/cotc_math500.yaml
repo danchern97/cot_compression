@@ -1,0 +1,37 @@
+# MATH-500, 0-shot, boxed answer, math_verify grading, avg@4.
+# Qwen3 specifies no repeat count for MATH-500 (only AIME=64, GPQA-D=10);
+# DeepSeek-R1 uses 64 everywhere. 4 sits inside both and halves generation
+# noise to <=0.8 pp on 500 questions.
+tag: cotc_bench
+task: cotc_math500
+dataset_path: HuggingFaceH4/MATH-500
+dataset_name: default
+output_type: generate_until
+training_split: null
+validation_split: null
+test_split: test
+doc_to_text: "{{problem}}\n\nPlease reason step by step, and put your final answer within \\boxed{}."
+doc_to_target: "{{answer}}"
+process_results: !function utils.math500_process_results
+num_fewshot: 0
+repeats: 4
+# Without a filter_list lm-eval installs `take_first` and silently discards every
+# sample but the first; take_first_k is what hands all `repeats` to the grader.
+filter_list:
+  - name: avg@4
+    filter:
+      - function: take_first_k
+        k: 4
+generation_kwargs:
+  do_sample: true
+  temperature: 0.6 # Qwen3 thinking mode: t=0.6, top-p=0.95, top-k=20
+  top_p: 0.95
+  top_k: 20
+  max_gen_toks: 32768
+  until: [] # EOS is appended by handle_stop_sequences; no task-level stop
+metric_list:
+  - metric: math_verify
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

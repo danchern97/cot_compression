@@ -3,10 +3,12 @@
 from cot_compression.reporting.data import (
     load_sample_logprobs,
     load_sample_probabilities,
+    load_sample_rows,
     load_sample_xy,
     load_summaries,
     load_token_logprobs,
     load_token_probabilities,
+    subset_summary,
     to_probabilities,
 )
 from cot_compression.reporting.plots import (
@@ -19,6 +21,7 @@ from cot_compression.reporting.plots import (
 __all__ = [
     "load_sample_logprobs",
     "load_sample_probabilities",
+    "load_sample_rows",
     "load_sample_xy",
     "load_summaries",
     "load_token_logprobs",
@@ -27,5 +30,6 @@ __all__ = [
     "plot_logprob_vs_compression",
     "plot_mean_std_box",
     "plot_sample_scatter",
+    "subset_summary",
     "to_probabilities",
 ]

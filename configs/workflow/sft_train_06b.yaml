@@ -1,0 +1,67 @@
+# @package _global_
+
+# Qwen3-0.6B full-parameter SFT. Same dataset, batch plan and eval slice as the
+# Qwen3-4B run in sft_train.yaml -- only the model and the three performance
+# knobs in training/sft_06b.yaml differ.
+#
+# A SEPARATE workflow file rather than `sft method=qwen3/0_6b`, because run_name
+# carries no model identifier:
+#
+#   run_name = ${run_tag}_lr${optim.lr}_gb${training.target_global_batch}
+#
+# so `sft method=qwen3/0_6b optim.lr=1e-5 training.target_global_batch=128`
+# resolves onto full_lr1e-05_gb128 -- the *finished 4B run*. resume_from_checkpoint
+# =auto would then read its LATEST pointer and from_pretrained() would load that
+# directory's own config.json, i.e. Qwen3-4B, under a 0.6B config. The plan
+# signature cannot catch it: the tokenized cache is shared (the two models ship
+# byte-identical tokenizers) and every batching knob matches, so the hash is the
+# same. The job would silently train the wrong model, append to the wrong W&B run
+# and prune its checkpoints.
+#
+# Defaulting run_tag here makes that impossible to reach by forgetting a flag.
+# build_sft_model_and_tokenizer carries the second line of defence.
+
+defaults:
+  - /paths: default
+  - /data: dolci_think_sft_7b_600k
+  - /method: qwen3/0_6b
+  - /training: sft_06b
+  - /optim: adamw
+  - /logging: wandb
+  - _self_
+
+mode: sft_train
+
+# Overridden per campaign; the 0.6B optimum is expected above the 4B's 1e-5, and
+# is picked by scripts/run_sft_sweep_06b.sh before the full run.
+optim:
+  lr: 0.00001
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1e-8
+
+logging:
+  group: sft-full-06b
+  name: ${run_name}
+  tags:
+    - qwen3-0.6b
+    - dolci
+    - sft
+
+# Not "full": that value belongs to the 4B campaign, and run_name is the W&B run
+# id as well as the directory name.
+run_tag: qwen3-0.6b
+run_name: ${run_tag}_lr${optim.lr}_gb${training.target_global_batch}
+
+paths:
+  run_dir: ${paths.output_dir}/runs/sft/${data.name}/${run_name}
+
+hydra:
+  run:
+    dir: ${paths.run_dir}
+  sweep:
+    dir: ${paths.run_dir}
+    subdir: .
+  job:
+    chdir: false

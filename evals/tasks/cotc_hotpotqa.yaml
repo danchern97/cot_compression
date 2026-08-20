@@ -1,0 +1,42 @@
+# HotpotQA, distractor setting, full 7,405-row validation (dev) split, 1 sample.
+# lm-eval has no HotpotQA task -- its `longbench`/`ruler` entries are
+# long-context variants -- so prompt and grader live in utils.py; EM and F1 are
+# ports of the official hotpot_evaluate_v1.py.
+# 7,405 questions put single-sample noise at ~+-0.6 pp, so repeats would be the
+# most expensive and least useful thing in the suite. Note there is no standard
+# LLM prompt for HotpotQA: this column is comparable across checkpoints, not to
+# published numbers.
+tag: cotc_bench
+task: cotc_hotpotqa
+dataset_path: hotpotqa/hotpot_qa
+dataset_name: distractor
+output_type: generate_until
+training_split: null
+validation_split: null
+test_split: validation
+doc_to_text: !function utils.hotpotqa_doc_to_text
+doc_to_target: "{{answer}}"
+process_results: !function utils.hotpotqa_process_results
+num_fewshot: 0
+repeats: 1
+filter_list:
+  - name: avg@1
+    filter:
+      - function: take_first_k
+        k: 1
+generation_kwargs:
+  do_sample: true
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  max_gen_toks: 32768
+  until: []
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+  - metric: f1
+    aggregation: mean
+    higher_is_better: true
+metadata:
+  version: 1.0

@@ -1,0 +1,25 @@
+# HotpotQA (distractor), non-thinking mode, standard CoT prompting, 500 questions.
+# Three deltas from cotc_hotpotqa, all deliberate:
+#   1. sampler -> Qwen3's non-thinking values;
+#   2. doc_to_text -> the same prompt with "Let's think step by step." appended.
+#      This is the only benchmark whose prompt lacked a step-by-step instruction,
+#      so it is the only one that needed the trigger added.
+#   3. process_docs -> the paper's 500-question subset ("HotpotQA (500 samples)"),
+#      seeded so it is the same 500 for every model.
+# EM is kept alongside F1; the paper reports F1 only, but the grader emits both and
+# EM is the stricter read of the same predictions.
+# Single sample: at 500 questions generation noise is ~+-2 pp, worse than the
+# +-0.6 pp of the full 7,405-row split, so this column is noisier than the
+# thinking-mode HotpotQA row and is not directly comparable to it.
+include: cotc_hotpotqa.yaml
+tag: cotc_bench_nothink
+task: cotc_nothink_hotpotqa500
+process_docs: !function utils.hotpotqa_sample_500
+doc_to_text: !function utils.hotpotqa_cot_doc_to_text
+generation_kwargs:
+  do_sample: true
+  temperature: 0.7 # Qwen3 non-thinking mode: t=0.7, top-p=0.8, top-k=20
+  top_p: 0.8
+  top_k: 20
+  max_gen_toks: 32768
+  until: []

@@ -22,7 +22,12 @@ from cot_compression.training.evaluate import (
     evaluate_methods,
     summarize_method,
 )
-from cot_compression.training.sft import ChunkedCELM, plan_epoch, train_sft
+from cot_compression.training.sft import (
+    ChunkedCELM,
+    check_checkpoint_architecture,
+    plan_epoch,
+    train_sft,
+)
 
 _PATCHING = {
     "compression_ratio": 4.0,
@@ -526,6 +531,73 @@ def test_plan_signature_changes_with_the_batching_knobs() -> None:
         lengths, starts, _plan_cfg(max_batch_tokens=128), epoch=0, world_size=1
     )
     assert base.signature != wider.signature
+
+
+def _write_qwen3_config(directory: Path, **overrides) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    config = {
+        "model_type": "qwen3",
+        "hidden_size": 1024,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "intermediate_size": 3072,
+        "vocab_size": 151936,
+        "tie_word_embeddings": True,
+    }
+    config.update(overrides)
+    (directory / "config.json").write_text(json.dumps(config))
+    return directory
+
+
+def _arch_cfg(model_dir: Path):
+    return OmegaConf.create(
+        {"method": {"model_name": str(model_dir), "trust_remote_code": False}}
+    )
+
+
+def test_checkpoint_architecture_guard_rejects_a_different_model(tmp_path) -> None:
+    """The one thing plan_signature cannot catch.
+
+    run_name (run_tag + lr + global batch) carries no model identifier, so a 0.6B
+    campaign that forgets its run_tag resolves onto the 4B run's directory. The
+    batch plan hashes identically -- both models share one tokenized cache, since
+    their tokenizers are byte-identical -- so only this check stands in the way.
+    """
+    wanted = _write_qwen3_config(tmp_path / "qwen3-0.6b")
+    # A Qwen3-4B checkpoint sitting in the directory the 0.6B run resolved to.
+    checkpoint = _write_qwen3_config(
+        tmp_path / "checkpoints" / "step-0004518",
+        hidden_size=2560,
+        num_hidden_layers=36,
+        num_attention_heads=32,
+        intermediate_size=9728,
+    )
+
+    with pytest.raises(ValueError, match="Refusing to resume") as excinfo:
+        check_checkpoint_architecture(_arch_cfg(wanted), checkpoint)
+
+    message = str(excinfo.value)
+    assert "hidden_size" in message and "num_hidden_layers" in message
+
+
+def test_checkpoint_architecture_guard_allows_a_genuine_resume(tmp_path) -> None:
+    wanted = _write_qwen3_config(tmp_path / "qwen3-0.6b")
+    checkpoint = _write_qwen3_config(tmp_path / "checkpoints" / "step-0000292")
+    check_checkpoint_architecture(_arch_cfg(wanted), checkpoint)
+
+
+def test_checkpoint_architecture_guard_skips_a_non_hf_checkpoint(tmp_path) -> None:
+    """A directory with no config.json declares no architecture to disagree with.
+
+    Real checkpoints always have one -- save_pretrained writes it -- so this only
+    covers the fake models the SFT tests train, and must not reach the hub.
+    """
+    checkpoint = tmp_path / "checkpoints" / "step-0000001"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "model.pt").write_bytes(b"")
+    check_checkpoint_architecture(_arch_cfg(tmp_path / "never-resolved"), checkpoint)
 
 
 def test_answer_loss_evaluation_smoke(monkeypatch, tmp_path) -> None:

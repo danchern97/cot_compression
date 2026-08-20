@@ -1,0 +1,57 @@
+# Qwen3-0.6B SFT recipe: sft_full_bf16 with three performance knobs re-tuned for a
+# model 6.7x smaller. Everything else is inherited unchanged, deliberately.
+#
+# None of the knobs below appear in `plan_signature` (which hashes seed, epoch,
+# world_size, max_length, max_batch_tokens, micro_batch_max_sequences,
+# length_group_size, target_global_batch, budget, row count and total length).
+# So the 0.6B run walks the *identical* curriculum as the 4B run -- same batch
+# plan 24fcce6d5fe32878 at target_global_batch=128, same 4,518 steps, same
+# fixed 512-row eval slice -- and its eval loss is directly comparable to the
+# 4B run's 0.8442. Changing anything the signature covers would break both the
+# comparison and resume.
+defaults:
+  - sft_full_bf16
+  - _self_
+
+# ON, same as the 4B run -- and this is a MEASURED decision, not an inherited one.
+#
+# Steady state at 0.6B is only 8.94 GiB (fp32 weights + grads aliased to the DDP
+# buckets + two AdamW moments) against the 4B run's 60, so turning checkpointing
+# off looked free: it removes one of the four forward-equivalents a checkpointed
+# step costs, worth ~30% wall-clock, and it is exact recomputation so gradients
+# are unchanged either way.
+#
+# scripts/ddp_memory_probe_06b.sh (job 25572975) says otherwise. Worst-rank peak
+# at the real 32,768-token micro-batch, 4-way DDP, moments live:
+#
+#   grad_ckpt=False  ce_chunk=4096    87.98 GiB  (94.3% of the card)
+#   grad_ckpt=False  ce_chunk=1024    82.76 GiB  (88.7%)
+#   grad_ckpt=True   ce_chunk=4096    20.52 GiB  (22.0%)
+#   grad_ckpt=True   ce_chunk=1024    15.96 GiB  (17.1%)
+#
+# Activations at 0.6B are ~2.2 MB/token uncheckpointed -- the model is small but
+# the sequences are not. Both grad_ckpt=False rows fail the pre-registered 86%
+# gate, and 32,768 tokens is the *typical* micro-batch here (mean row ~10.2k, so
+# three rows fill the budget), not a rare tail. Running an 19-25 h job at 89-94%
+# occupancy with shapes that change every step is how the 4B campaign burned
+# three probe jobs on OOMs.
+#
+# The headroom this leaves is the price of comparability: max_batch_tokens is
+# frozen at the 4B value because plan_signature covers it. Dropping it to 16,384
+# would let checkpointing go off at 47.42 GiB (50.8%) and buy back the ~30%, but
+# it forks the batch plan and forfeits the direct comparison to the 4B run's
+# 0.8442 that this campaign exists to make.
+gradient_checkpointing: true
+
+# 1024 -> 4096: eight lm_head+CE chunks per 32k micro-batch instead of 32, with
+# GEMMs four times larger. Chunking is an exact sum decomposition of the
+# cross-entropy, so the loss is unchanged. Measured cost is +4.56 GiB (15.96 ->
+# 20.52), which at 22% of the card is free -- unlike under grad_ckpt=False, where
+# the same 4.56 GiB is the difference between 88.7% and 94.3%.
+ce_chunk_tokens: 4096
+
+# A full 0.6B checkpoint is ~7 GB (2.4 fp32 weights + 4.8 AdamW moments), not the
+# 4B run's 48 GB, so rank 0 writes it in ~1-2 min rather than the measured ~9.
+# 45 min therefore idles the node ~3% while losing at most 45 min of work per
+# crash -- the 4B run had to trade the other way.
+checkpoint_minutes: 45

@@ -1,0 +1,14 @@
+# AIME'25, non-thinking mode, standard CoT prompting, avg@16.
+# Inherits cotc_aime25_16 (30 questions, 16 repeats); only the sampler changes.
+# max_gen_toks stays 38912: it is part of the replaced generation_kwargs block, and
+# dropping to the 32768 default would truncate the longest traces.
+include: cotc_aime25_16.yaml
+tag: cotc_bench_nothink
+task: cotc_nothink_aime25_16
+generation_kwargs:
+  do_sample: true
+  temperature: 0.7 # Qwen3 non-thinking mode: t=0.7, top-p=0.8, top-k=20
+  top_p: 0.8
+  top_k: 20
+  max_gen_toks: 38912
+  until: []
