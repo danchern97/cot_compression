@@ -129,6 +129,9 @@ The run directory contains:
 
 Prepared records retain every non-empty reference/verifier payload once in the
 list-valued `ground_truths` field; graders derive the primary answer when needed.
+Every trace row also stores `generator_model` and `generator_model_revision`, so
+Parquet shards from multiple generators can be appended to one Hub dataset
+without relying on filenames or external manifests to recover provenance.
 IFEval and general-quality prompts are not given a boxed-answer or `Answer:`
 suffix because such text can conflict with their requested output format. Code
 and code-stdio prompts receive a canonical single-Python-code-block instruction.

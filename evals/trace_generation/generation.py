@@ -54,6 +54,8 @@ def trace_record(
     )
     return {
         "config_hash": config.config_hash,
+        "generator_model": config.model,
+        "generator_model_revision": config.model_revision,
         **prompt.to_dict(),
         "rollout_id": f"{prompt.prompt_id}:r{rollout_index}",
         "rollout_index": rollout_index,

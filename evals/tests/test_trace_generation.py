@@ -362,6 +362,8 @@ def test_natural_eos_completeness_and_domain_caps():
     )
     assert math["complete"] is True
     assert math["ended_by_eos"] is True
+    assert math["generator_model"] == config.model
+    assert math["generator_model_revision"] == config.model_revision
     assert math["requested_max_tokens"] == 32_768
     assert code["complete"] is False
     assert code["ended_by_eos"] is False

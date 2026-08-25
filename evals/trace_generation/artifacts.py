@@ -24,6 +24,8 @@ MESSAGE_TYPE = pa.struct([("role", pa.string()), ("content", pa.string())])
 TRACE_SCHEMA = pa.schema(
     [
         ("config_hash", pa.string()),
+        ("generator_model", pa.string()),
+        ("generator_model_revision", pa.string()),
         ("source_row_index", pa.int64()),
         ("prompt_id", pa.string()),
         ("rollout_id", pa.string()),
