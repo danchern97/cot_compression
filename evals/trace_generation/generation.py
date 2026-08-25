@@ -38,12 +38,19 @@ def trace_record(
     generation_error: str | None = None,
 ) -> dict[str, Any]:
     truncated = finish_reason == "length"
+    ended_by_eos = finish_reason == "stop"
     grade = grade_completion(
         prompt.domain,
         completion,
         prompt.ground_truth,
         generation_error=generation_error,
         truncated=truncated,
+    )
+    complete = (
+        generation_error is None
+        and ended_by_eos
+        and grade.thinking is not None
+        and bool(grade.final_response.strip())
     )
     return {
         "config_hash": config.config_hash,
@@ -63,8 +70,11 @@ def trace_record(
         "correct": grade.correct,
         "qa_token_f1": grade.qa_token_f1,
         "completion_tokens": completion_tokens,
+        "requested_max_tokens": config.max_tokens_for(prompt.domain),
         "finish_reason": finish_reason,
         "stop_reason": _stop_reason(stop_reason),
+        "ended_by_eos": ended_by_eos,
+        "complete": complete,
         "truncated": truncated,
         "extraction_status": grade.extraction_status,
         "generation_error": generation_error,
@@ -81,6 +91,9 @@ def build_engine(config: GenerationConfig) -> Any:
         tensor_parallel_size=config.tensor_parallel_size,
         gpu_memory_utilization=config.gpu_memory_utilization,
         max_model_len=config.max_model_len,
+        max_num_seqs=config.max_num_seqs,
+        max_num_batched_tokens=config.max_num_batched_tokens,
+        enable_prefix_caching=config.enable_prefix_caching,
         trust_remote_code=False,
         seed=config.base_seed,
     )
@@ -98,7 +111,7 @@ def generate_chunk(
     requests: list[tuple[PreparedPrompt, int]] = [
         (prompt, rollout_index)
         for prompt in prompts
-        for rollout_index in range(config.num_rollouts)
+        for rollout_index in config.rollout_indices
     ]
     rendered = [prompt.rendered_prompt for prompt, _ in requests]
     params = [
@@ -109,7 +122,7 @@ def generate_chunk(
             top_k=config.top_k,
             min_p=config.min_p,
             presence_penalty=config.presence_penalty,
-            max_tokens=config.max_output_tokens,
+            max_tokens=config.max_tokens_for(prompt.domain),
             seed=rollout_seed(config.base_seed, prompt.source_row_index, rollout_index),
         )
         for prompt, rollout_index in requests

@@ -17,8 +17,8 @@ class GradeResult:
     final_response: str
     extracted_answer: str | None
     extraction_status: str
-    score: float
-    correct: bool
+    score: float | None
+    correct: bool | None
     qa_token_f1: float | None
 
 
@@ -180,7 +180,7 @@ def grade_final_response(
 def grade_completion(
     domain: str,
     completion: str,
-    ground_truth: str,
+    ground_truth: str | None,
     *,
     generation_error: str | None = None,
     truncated: bool = False,
@@ -189,5 +189,9 @@ def grade_completion(
     status = "generation_error" if generation_error is not None else status
     status = "truncated" if truncated else status
     if status != "ok":
-        return GradeResult(thinking, final, None, status, 0.0, False, None)
+        if domain in {"math", "qa"} and ground_truth is not None:
+            return GradeResult(thinking, final, None, status, 0.0, False, None)
+        return GradeResult(thinking, final, None, status, None, None, None)
+    if domain not in {"math", "qa"} or ground_truth is None:
+        return GradeResult(thinking, final, None, "ungraded", None, None, None)
     return replace(grade_final_response(domain, final, ground_truth), thinking=thinking)

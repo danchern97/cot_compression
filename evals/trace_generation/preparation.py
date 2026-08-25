@@ -9,50 +9,41 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from .config import DATASET_REVISION, DATASET_SPLIT
-from .grading import math_answer_is_verifiable
 
 MATH_SUFFIX = "Please reason step by step, and put your final answer within \\boxed{}."
-QA_SUFFIX = (
-    "Please reason step by step. End your response with exactly one final line "
-    'in the form "Answer: <answer>".'
+CODE_SUFFIX = (
+    "Reason through the problem, then provide the final Python solution in exactly "
+    "one fenced `python` code block."
 )
 
-QA_SOURCES = frozenset(
-    {
-        "hamishivi/virtuoussy_multi_subject_rlvr_filtered",
-        "hamishivi/tulu_3_rewritten_400k_string_f1_only_v2_nocode_all_"
-        "filtered_qwen2_5_openthoughts2_filtered",
-    }
-)
+DOMAIN_BY_LABEL = {
+    "math": "math",
+    "general-quality_ref": "general_quality_ref",
+    "ifeval": "ifeval",
+    "code": "code",
+    "code_stdio": "code_stdio",
+    "general-quality": "general_quality",
+}
+
+SUFFIX_BY_DOMAIN = {
+    "math": MATH_SUFFIX,
+    "code": CODE_SUFFIX,
+    "code_stdio": CODE_SUFFIX,
+}
 
 FILTER_PIPELINE = (
-    "require one dataset label, one non-empty ground truth, and a non-empty prompt",
-    "select math or general-quality_ref rows",
-    "math: require passrate > 0",
-    "math: reject explicit image, figure, or diagram references",
-    "math: require math_verify to parse and self-verify the ground truth",
-    "qa: require a whitelisted Tulu-rewritten or multi-subject source",
-    "qa: require a single-line, non-code-fenced answer of at most 128 characters",
+    "require one supported dataset label and a non-empty prompt",
+    "select all six dataset families for compression trace generation",
+    "preserve every non-empty ground-truth entry without using it for eligibility",
     "strip exactly one case-insensitive leading user: marker",
-    "append the domain-specific answer-format instruction",
+    "append a boxed-answer instruction to math prompts",
+    "append a single-Python-code-block instruction to code prompts",
+    "leave QA, IFEval, and general-quality prompt semantics unchanged",
     "render with the model chat template and thinking enabled",
-    "reject prompts over model_context_length - max_output_tokens",
+    "reject only prompts over model_context_length - max_output_tokens",
 )
 
 _LEADING_USER = re.compile(r"^\s*user\s*:\s*", re.IGNORECASE)
-_VISUAL_CONTEXT = re.compile(
-    r"(?:!\[[^]]*\]\(|<img\b|<image>|\[image\]|"
-    r"as\s+(?:is\s+)?shown\s+(?:above|below)\b|"
-    r"as\s+(?:is\s+)?shown\s+(?:in|on)\s+(?:the\s+)?"
-    r"(?:figure|diagram|image|graph|chart)\b|"
-    r"shown\s+in\s+(?:the\s+)?(?:figure|diagram|image|graph|chart)\b|"
-    r"(?:figure|diagram|image|graph|chart)\s+(?:above|below)\b|"
-    r"following\s+(?:figure|diagram|image|graph|chart)\b|"
-    r"(?:refer\s+to|see)\s+(?:the\s+)?"
-    r"(?:figure|diagram|image|graph|chart)\b|\bpictured\b)",
-    re.IGNORECASE,
-)
-
 _SOURCE_METADATA_FIELDS = (
     "custom_id",
     "id",
@@ -86,20 +77,22 @@ class PreparedPrompt:
     normalized_prompt: str
     prepared_prompt: str
     rendered_prompt: str
-    ground_truth: str
+    ground_truths: tuple[str, ...]
     prompt_tokens: int
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["ground_truths"] = list(self.ground_truths)
+        return payload
+
+    @property
+    def ground_truth(self) -> str | None:
+        return self.ground_truths[0].strip() if self.ground_truths else None
 
 
 def strip_leading_user(prompt: str) -> str:
     """Remove exactly one leading ``user:`` role marker."""
     return _LEADING_USER.sub("", prompt, count=1).strip()
-
-
-def has_missing_visual_context(prompt: str) -> bool:
-    return bool(_VISUAL_CONTEXT.search(prompt))
 
 
 def _single_string(value: object) -> str | None:
@@ -111,10 +104,10 @@ def _single_string(value: object) -> str | None:
     return item.strip()
 
 
-def _qa_gold_is_compact(gold: str) -> bool:
-    return (
-        len(gold) <= 128 and "\n" not in gold and "\r" not in gold and "```" not in gold
-    )
+def _ground_truths(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item.strip())
 
 
 def _dataset_label(row: dict[str, Any]) -> str | None:
@@ -124,33 +117,15 @@ def _dataset_label(row: dict[str, Any]) -> str | None:
 def classify_row(row: dict[str, Any]) -> tuple[str | None, str]:
     """Return (domain, filter reason) before model-specific prompt rendering."""
     label = _dataset_label(row)
-    gold = _single_string(row.get("ground_truth"))
     prompt = row.get("prompt")
     if label is None:
         return None, "invalid_dataset_label"
-    if gold is None:
-        return None, "invalid_ground_truth"
+    domain = DOMAIN_BY_LABEL.get(label)
+    if domain is None:
+        return None, "domain_not_selected"
     if not isinstance(prompt, str) or not strip_leading_user(prompt):
         return None, "invalid_prompt"
-
-    if label == "math":
-        passrate = row.get("passrate")
-        if not isinstance(passrate, (int, float)) or passrate <= 0:
-            return None, "math_no_prior_hit"
-        if has_missing_visual_context(prompt):
-            return None, "math_missing_visual_context"
-        if not math_answer_is_verifiable(gold):
-            return None, "math_unverifiable_gold"
-        return "math", "eligible"
-
-    if label == "general-quality_ref":
-        if row.get("original_dataset") not in QA_SOURCES:
-            return None, "qa_source_not_whitelisted"
-        if not _qa_gold_is_compact(gold):
-            return None, "qa_noncompact_gold"
-        return "qa", "eligible"
-
-    return None, "domain_not_selected"
+    return domain, "eligible"
 
 
 def _prompt_id(dataset_revision: str, split: str, source_row_index: int) -> str:
@@ -186,8 +161,10 @@ def prepare_row(
 
     original_prompt = str(row["prompt"])
     normalized_prompt = strip_leading_user(original_prompt)
-    suffix = MATH_SUFFIX if domain == "math" else QA_SUFFIX
-    prepared_prompt = f"{normalized_prompt}\n\n{suffix}"
+    suffix = SUFFIX_BY_DOMAIN.get(domain)
+    prepared_prompt = (
+        f"{normalized_prompt}\n\n{suffix}" if suffix else normalized_prompt
+    )
     messages = [{"role": "user", "content": prepared_prompt}]
     try:
         rendered = tokenizer.apply_chat_template(
@@ -202,6 +179,7 @@ def prepare_row(
     if len(encoded) > max_prompt_tokens:
         return None, "prompt_over_context_budget"
 
+    ground_truths = _ground_truths(row.get("ground_truth"))
     return (
         PreparedPrompt(
             source_row_index=source_row_index,
@@ -217,7 +195,7 @@ def prepare_row(
             normalized_prompt=normalized_prompt,
             prepared_prompt=prepared_prompt,
             rendered_prompt=str(rendered),
-            ground_truth=str(_single_string(row.get("ground_truth"))),
+            ground_truths=ground_truths,
             prompt_tokens=len(encoded),
         ),
         "eligible",
@@ -231,10 +209,19 @@ def prepare_prompts(
     max_examples: int | None = None,
     dataset_revision: str = DATASET_REVISION,
     split: str = DATASET_SPLIT,
+    allowed_domains: set[str] | frozenset[str] | None = None,
 ) -> tuple[list[PreparedPrompt], dict[str, int]]:
     prepared: list[PreparedPrompt] = []
     counts: Counter[str] = Counter()
     for index, row in enumerate(rows):
+        domain, _ = classify_row(row)
+        if (
+            domain is not None
+            and allowed_domains is not None
+            and domain not in allowed_domains
+        ):
+            counts["domain_not_requested"] += 1
+            continue
         prompt, reason = prepare_row(
             row,
             index,
@@ -250,8 +237,8 @@ def prepare_prompts(
                 counts["stopped_at_max_examples"] += 1
                 break
     counts["eligible_total"] = len(prepared)
-    counts["eligible_math"] = sum(p.domain == "math" for p in prepared)
-    counts["eligible_qa"] = sum(p.domain == "qa" for p in prepared)
+    for domain in DOMAIN_BY_LABEL.values():
+        counts[f"eligible_{domain}"] = sum(p.domain == domain for p in prepared)
     return prepared, dict(sorted(counts.items()))
 
 
@@ -262,6 +249,10 @@ def partition_prompts(
         raise ValueError("num_shards must be positive")
     if not 0 <= shard_index < num_shards:
         raise ValueError("shard_index must be in [0, num_shards)")
-    start = len(prompts) * shard_index // num_shards
-    stop = len(prompts) * (shard_index + 1) // num_shards
-    return prompts[start:stop]
+    # Source rows are grouped by dataset family. Modulo partitioning gives every
+    # GPU a comparable domain mix while remaining stable across reruns.
+    return [
+        prompt
+        for prompt in prompts
+        if prompt.source_row_index % num_shards == shard_index
+    ]

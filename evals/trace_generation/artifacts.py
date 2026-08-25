@@ -40,7 +40,7 @@ TRACE_SCHEMA = pa.schema(
         ("normalized_prompt", pa.string()),
         ("prepared_prompt", pa.string()),
         ("rendered_prompt", pa.string()),
-        ("ground_truth", pa.string()),
+        ("ground_truths", pa.list_(pa.string())),
         ("messages", pa.list_(MESSAGE_TYPE)),
         ("completion_raw", pa.string()),
         ("thinking", pa.string()),
@@ -51,8 +51,11 @@ TRACE_SCHEMA = pa.schema(
         ("qa_token_f1", pa.float64()),
         ("prompt_tokens", pa.int32()),
         ("completion_tokens", pa.int32()),
+        ("requested_max_tokens", pa.int32()),
         ("finish_reason", pa.string()),
         ("stop_reason", pa.string()),
+        ("ended_by_eos", pa.bool_()),
+        ("complete", pa.bool_()),
         ("truncated", pa.bool_()),
         ("extraction_status", pa.string()),
         ("generation_error", pa.string()),
@@ -74,7 +77,7 @@ PREPARED_SCHEMA = pa.schema(
         ("normalized_prompt", pa.string()),
         ("prepared_prompt", pa.string()),
         ("rendered_prompt", pa.string()),
-        ("ground_truth", pa.string()),
+        ("ground_truths", pa.list_(pa.string())),
         ("prompt_tokens", pa.int32()),
     ]
 )
@@ -198,24 +201,28 @@ def environment_metadata() -> dict[str, Any]:
 
 
 def shard_prompt_counts(total: int, num_shards: int) -> list[int]:
-    return [
-        total * (index + 1) // num_shards - total * index // num_shards
-        for index in range(num_shards)
-    ]
+    quotient, remainder = divmod(total, num_shards)
+    return [quotient + int(index < remainder) for index in range(num_shards)]
 
 
 def build_manifest(
     config: GenerationConfig,
     filter_counts: dict[str, int],
+    shard_counts: list[int] | None = None,
+    *,
+    filter_pipeline: Iterable[str] | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     eligible = int(filter_counts["eligible_total"])
-    counts = shard_prompt_counts(eligible, config.num_shards)
-    return {
-        "schema_version": 1,
+    counts = shard_counts or shard_prompt_counts(eligible, config.num_shards)
+    if len(counts) != config.num_shards or sum(counts) != eligible:
+        raise ValueError("shard counts do not match the configured prompt total")
+    manifest = {
+        "schema_version": 2,
         "config_hash": config.config_hash,
         "config": config.payload(),
         "filter_counts": filter_counts,
-        "filter_pipeline": list(FILTER_PIPELINE),
+        "filter_pipeline": list(filter_pipeline or FILTER_PIPELINE),
         "resolved_revisions": {
             "dataset": config.dataset_revision,
             "model": config.model_revision,
@@ -232,6 +239,12 @@ def build_manifest(
             "revisions plus a compatible GPU/runtime stack."
         ),
     }
+    if extra:
+        overlap = set(manifest) & set(extra)
+        if overlap:
+            raise ValueError(f"extra manifest fields overlap built-ins: {overlap}")
+        manifest.update(extra)
+    return manifest
 
 
 def ensure_manifest(run_dir: Path, manifest: dict[str, Any]) -> Path:
@@ -249,6 +262,8 @@ def ensure_manifest(run_dir: Path, manifest: dict[str, Any]) -> Path:
             raise ValueError("Existing manifest configuration is incompatible")
         if existing.get("filter_pipeline") != manifest["filter_pipeline"]:
             raise ValueError("Existing manifest filter pipeline is incompatible")
+        if existing.get("fulfillment") != manifest.get("fulfillment"):
+            raise ValueError("Existing manifest fulfillment sources are incompatible")
         return path
     atomic_write_json(path, manifest)
     return path
@@ -288,7 +303,7 @@ def _validate_rows(
     requests = [
         (prompt, rollout_index)
         for prompt in prompts
-        for rollout_index in range(config.num_rollouts)
+        for rollout_index in config.rollout_indices
     ]
     if len(rows) != len(requests):
         raise ValueError(f"Chunk {path} has {len(rows)} rows, expected {len(requests)}")
@@ -320,9 +335,13 @@ def validate_chunk(
 class _Metrics:
     def __init__(self) -> None:
         self.rollouts = 0
+        self.graded_rollouts = 0
         self.correct = 0
         self.prompt_ids: set[str] = set()
+        self.graded_prompt_ids: set[str] = set()
         self.correct_prompt_ids: set[str] = set()
+        self.complete = 0
+        self.complete_prompt_ids: set[str] = set()
         self.lengths: list[int] = []
         self.extraction_failures = 0
         self.truncated = 0
@@ -333,9 +352,15 @@ class _Metrics:
         self.rollouts += 1
         prompt_id = str(row["prompt_id"])
         self.prompt_ids.add(prompt_id)
-        if bool(row["correct"]):
-            self.correct += 1
-            self.correct_prompt_ids.add(prompt_id)
+        if row.get("correct") is not None:
+            self.graded_rollouts += 1
+            self.graded_prompt_ids.add(prompt_id)
+            if bool(row["correct"]):
+                self.correct += 1
+                self.correct_prompt_ids.add(prompt_id)
+        if bool(row.get("complete")):
+            self.complete += 1
+            self.complete_prompt_ids.add(prompt_id)
         self.lengths.append(int(row["completion_tokens"]))
         if row["extraction_status"] not in {"ok", "incorrect_answer"}:
             self.extraction_failures += 1
@@ -346,15 +371,28 @@ class _Metrics:
 
     def summary(self) -> dict[str, int | float | None]:
         prompts = len(self.prompt_ids)
+        graded_prompts = len(self.graded_prompt_ids)
         return {
             "rollouts": self.rollouts,
+            "graded_rollouts": self.graded_rollouts,
             "correct_rollouts": self.correct,
-            "rollout_pass_rate": self.correct / self.rollouts if self.rollouts else 0.0,
+            "rollout_pass_rate": (
+                self.correct / self.graded_rollouts if self.graded_rollouts else None
+            ),
             "prompts": prompts,
+            "graded_prompts": graded_prompts,
             "prompts_passed": len(self.correct_prompt_ids),
-            "prompt_pass_at_4": len(self.correct_prompt_ids) / prompts
-            if prompts
-            else 0.0,
+            "prompt_pass_at_k": (
+                len(self.correct_prompt_ids) / graded_prompts
+                if graded_prompts
+                else None
+            ),
+            "complete_rollouts": self.complete,
+            "completion_rate": self.complete / self.rollouts if self.rollouts else 0.0,
+            "prompts_with_complete": len(self.complete_prompt_ids),
+            "prompt_complete_at_k": (
+                len(self.complete_prompt_ids) / prompts if prompts else 0.0
+            ),
             "extraction_failures": self.extraction_failures,
             "extraction_failure_rate": (
                 self.extraction_failures / self.rollouts if self.rollouts else 0.0
@@ -394,8 +432,14 @@ def _prepared_shard_rows(
         all_indices.extend(int(row["source_row_index"]) for row in rows)
         all_prompt_ids.extend(str(row["prompt_id"]) for row in rows)
 
-    if all_indices != sorted(all_indices) or len(all_indices) != len(set(all_indices)):
-        raise ValueError("Prepared shards are not a stable non-overlapping partition")
+    if len(all_indices) != len(set(all_indices)):
+        raise ValueError("Prepared shards are not a non-overlapping partition")
+    for shard_index, rows in enumerate(shards):
+        indices = [int(row["source_row_index"]) for row in rows]
+        if indices != sorted(indices) or any(
+            index % len(shards) != shard_index for index in indices
+        ):
+            raise ValueError("Prepared shards are not the stable modulo partition")
     if len(all_prompt_ids) != len(set(all_prompt_ids)):
         raise ValueError("Prepared shards contain duplicate prompt IDs")
     if len(all_indices) != int(manifest["eligible_prompts"]):
@@ -447,12 +491,15 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
         "config_hash": manifest["config_hash"],
         "filter_counts": manifest["filter_counts"],
         "global": metrics["global"].summary(),
-        "domains": {domain: metrics[domain].summary() for domain in ("math", "qa")},
+        "domains": {
+            domain: metrics[domain].summary()
+            for domain in sorted(name for name in metrics if name != "global")
+        },
     }
     atomic_write_json(run_dir / "summary.json", payload)
     csv_path = run_dir / "summary_by_domain.csv"
     rows = [
-        dict(domain=domain, **payload["domains"][domain]) for domain in ("math", "qa")
+        dict(domain=domain, **values) for domain, values in payload["domains"].items()
     ]
     with (
         _atomic_path(csv_path) as temporary,
@@ -466,22 +513,21 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
 
 def format_summary(payload: dict[str, Any]) -> str:
     header = (
-        f"{'domain':<8} {'rollouts':>10} {'pass':>8} {'prompts':>9} "
-        f"{'pass@4':>8} {'extract':>8} {'trunc':>8} {'errors':>7} "
-        f"{'mean tok':>9} {'median':>8}"
+        f"{'domain':<20} {'rollouts':>10} {'complete':>9} {'prompt≥1':>9} "
+        f"{'graded':>8} {'pass':>8} {'trunc':>8} {'errors':>7} {'mean tok':>9}"
     )
     lines = [header, "-" * len(header)]
     groups = [("global", payload["global"])] + list(payload["domains"].items())
     for name, values in groups:
         lines.append(
-            f"{name:<8} {values['rollouts']:>10d} "
-            f"{values['rollout_pass_rate']:>7.2%} {values['prompts']:>9d} "
-            f"{values['prompt_pass_at_4']:>7.2%} "
-            f"{values['extraction_failure_rate']:>7.2%} "
+            f"{name:<20} {values['rollouts']:>10d} "
+            f"{values['completion_rate']:>8.2%} "
+            f"{values['prompt_complete_at_k']:>8.2%} "
+            f"{values['graded_rollouts']:>8d} "
+            f"{_format_rate(values['rollout_pass_rate']):>8} "
             f"{values['truncation_rate']:>7.2%} "
             f"{values['generation_errors']:>7d} "
-            f"{values['completion_tokens_mean']:>9.1f} "
-            f"{values['completion_tokens_median']:>8.1f}"
+            f"{values['completion_tokens_mean']:>9.1f}"
         )
     lines.append("")
     lines.append(
@@ -492,3 +538,7 @@ def format_summary(payload: dict[str, Any]) -> str:
         )
     )
     return "\n".join(lines)
+
+
+def _format_rate(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.2%}"
