@@ -1,0 +1,125 @@
+# Encoder training recipe. Inherits the SFT batch-planning knobs unchanged --
+# plan_epoch, the greedy token budget and the crash-safe checkpoint loop are the
+# same machinery -- and overrides only what differs for a 34M model trained
+# against a frozen decoder.
+defaults:
+  - sft_full_bf16
+  - _self_
+
+# The ENCODER's master weights. fp32 for the reason build_optimizer documents:
+# bf16 parameters put the Adam moments in bf16 too, and updates round away.
+torch_dtype: float32
+autocast_dtype: bfloat16
+# The frozen DECODER, which has no optimizer state and so no reason to be fp32.
+decoder_dtype: bfloat16
+
+# Batch planning budgets on Pass A (prompt + CoT), which drives memory: Pass B is
+# prompt + K + answer and is strictly shorter at any compression ratio above one.
+# Rows longer than this are dropped, never truncated -- truncating would cut
+# placeholder slots off and desynchronize slot_positions from K.
+max_length: 32768
+
+# MEASURED, not inherited. Calibration job 26146176 (60 steps, arm 3, 1xH100) ran
+# at a steady 6.23 GiB peak of 93.34 with max_batch_tokens=32768 -- the value the
+# 4B SFT campaign uses, where it was the memory ceiling. Here the decoder is frozen
+# and checkpointed and the encoder is 34M, so that budget was ~15x too tight: every
+# micro-batch held 1 or 2 rows and throughput sat near 4% MFU.
+#
+# 4x the budget puts the projected peak near 25 GiB, well inside the card, and
+# lifts the sequence cap that was also binding. Both knobs are inside
+# plan_signature, so changing them invalidates any existing checkpoint by design.
+max_batch_tokens: 131072
+micro_batch_max_sequences: 16
+
+# Batch ORDER, which the length-grouped default got wrong for this objective.
+#
+# Sorting within 8192-row groups and never shuffling (HF's `LengthGroupedSampler`,
+# and what this run did until now) marches every 148 steps from 24k-token CoTs
+# down to 350-token ones. Since domain is nearly a function of length in this
+# corpus -- decile 0 is 50% general_quality_ref / 40% ifeval, decile 9 is 71% math
+# / 25% code_stdio -- that made 85% of steps a single length decile and mostly one
+# domain, and it put a 148-step sawtooth in every curve.
+#
+# MEASURED on the 175,928-row plan, with per-micro-batch times from the probe:
+#   global sort, no inner shuffle    0.0% padding   5.4 h/rank per epoch
+#   + 1024-row inner shuffle         1.1% padding   5.5 h/rank  <- here
+#   + 8192-row inner shuffle         7.3% padding   6.3 h/rank
+# Shuffling whole micro-steps is free; shuffling individual micro-batches instead
+# (mixing lengths across ranks) costs 1.6x wall clock, because ranks synchronize on
+# every micro-batch and all four then wait for the longest.
+length_bucket_rows: 1024
+shuffle_micro_steps: true
+
+# 32 -> 128 so an optimizer step spans several length ranges rather than one.
+# With 32, a single micro-step of short rows already reaches the target (4 ranks x
+# 16 rows), so 85% of steps stayed inside one length decile even with the order
+# shuffled. At 128 a step accumulates ~3 micro-steps and 96% of them span two or
+# more deciles, at no throughput cost -- the micro-batches are identical, only
+# their grouping into steps changes.
+#
+# Consequences to keep in mind: a step is ~144 rows instead of ~64, so an epoch is
+# 1,189 steps instead of 2,962; and `optim.lr` was tuned at the smaller batch.
+target_global_batch: 128
+# 1024 -> 4096. Profiling (job 26152913) put `passB_answer_ce` at 24.6% of CUDA
+# time and `Command Buffer Full` at 38% of CPU -- the launch-queue stall that comes
+# from enqueueing many small kernels. Each chunk is a separate checkpointed
+# lm_head + fp32 CE, so wider chunks mean a quarter as many launches and four
+# times larger GEMMs. The extra memory is free here: peak is 16.6 GiB of 93.34.
+#
+# Chunking is an exact sum decomposition, so the loss is unchanged either way.
+ce_chunk_tokens: 4096
+
+# Auxiliary next-patch pass: round its width up to a multiple of this, so compiled
+# FlexAttention shapes repeat. MEASURED over the whole plan (census job 26695433,
+# plan 0ca26a720b2b58cd): unbucketed widths give 9,715 distinct train shapes; a
+# multiple of 512 gives 101 (+3.3% tokens), 1024 gives 62 (+6.6%), 2048 gives 42
+# (+14.5%). 1024 trades 20 more one-time compilations -- cached on scratch across
+# jobs -- for half the padding of 2048. Never a power-of-two ladder: that nearly
+# doubles W, and attention memory grows with W^2. Outside plan_signature.
+aux_width_multiple: 1024
+# Dynamo recompile limit for the aux pass, made FATAL rather than a silent fallback
+# to eager flex attention (which materializes [B, H, W, W] and OOMs: the Sep 11
+# resume). Sized from the same census: 62 train + 27 eval shapes at a multiple of
+# 1024, with headroom -- but low enough that guard churn (one recompile per step)
+# still trips it within a few hundred steps instead of burning the budget.
+aux_recompile_limit: 128
+
+# Keep ON. Measured both ways on a mid-epoch batch (profile job 26153973):
+#
+#   checkpointing ON  : 2489 answer-tok/s, peak 12.09 GiB
+#   checkpointing OFF : 3050 answer-tok/s (+22.5%), peak 79.62 GiB of 93.34
+#
+# +22.5% is real, but 79.62 GiB is on a *mid-epoch* batch (16 rows, ~1k-token
+# Pass B). The long tail reaches K=8033 and a ~8.6k-token Pass B, where the same
+# setting OOMs. Not worth risking a mid-run failure for 22%; revisit only
+# alongside a lower max_batch_tokens, which costs throughput of its own.
+#
+# The flag is now honoured (FrozenBackbone used to hardcode it on and ignore this).
+gradient_checkpointing: true
+
+# 14 of the 16 allocated cores, matching evaluation/answer_loss.yaml.
+#
+# Kept, but NOT because it helped: measured against num_workers=8 at matched steps
+# it is worth +0.2% (626.8 vs 625.8, 861.4 vs 860.0 answer-tok/s at steps 5/15).
+# The hypothesis it was meant to test -- that a 5x batch increase buying only +23%
+# throughput at 18% memory meant a DataLoader-starved GPU -- is refuted. Per-sample
+# CPU prep is not the bottleneck.
+#
+# What remains: ~5% MFU is roughly what this shape of workload gives. Two separate
+# model invocations per step (a no-grad Pass A over ~6k tokens and a checkpointed
+# Pass B), shapes that change every micro-batch, and a chunked lm_head -- against
+# the SFT campaign's 27%, which had one uniform forward/backward over packed
+# batches. Do not spend more on this without profiling first.
+num_workers: 14
+
+eval_interval: 100
+eval_examples: 512
+log_interval: 10
+checkpoint_minutes: 30
+keep_checkpoints: 2
+resume_from_checkpoint: auto
+
+# Diagnostic only. Checks every backward op and raises at the first NaN with the
+# forward traceback that produced it, at roughly 3x the cost. Turn on to chase a
+# NaN from a resumed checkpoint; leave off for real training.
+detect_anomaly: false

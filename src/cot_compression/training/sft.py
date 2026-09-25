@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -118,6 +118,42 @@ class BatchPlan:
     dropped: int
     kept: int
     signature: str
+    # Global rows per step. `denom` counts supervised tokens; the encoder's
+    # objective is a mean over ROWS, so it needs this instead -- and comparing it
+    # against the rows that actually arrive is what catches a dropped row.
+    rows: list[int] = field(default_factory=list)
+
+
+def _pack(
+    order: list[int],
+    lengths: np.ndarray,
+    max_batch_tokens: int,
+    max_sequences: int,
+) -> list[list[int]]:
+    """Token-budget micro-batches over `order`, in exactly the order given.
+
+    Same greedy rule as the eval path (`evaluate.batch_would_exceed_limit`): admit a
+    row while `max_len * (n + 1)` stays inside the budget. Deliberately does NOT
+    sort -- the caller owns that decision, because it sets both the padding and
+    *which rows share a micro-batch*, and those two pull in opposite directions.
+    """
+    batches: list[list[int]] = []
+    current: list[int] = []
+    widest = 0
+    for index in order:
+        candidate = max(widest, int(lengths[index]))
+        full = current and (
+            candidate * (len(current) + 1) > max_batch_tokens
+            or len(current) >= max_sequences
+        )
+        if full:
+            batches.append(current)
+            current, candidate = [], int(lengths[index])
+        current.append(int(index))
+        widest = candidate
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _greedy_micro_batches(
@@ -129,32 +165,74 @@ def _greedy_micro_batches(
 ) -> list[list[int]]:
     """Length-grouped, token-budget micro-batches.
 
-    Same greedy rule as the eval path (`evaluate.batch_would_exceed_limit`):
-    admit a row while `max_len * (n + 1)` stays inside the budget. Sorting within
-    a large group first is what keeps padding at a couple of percent -- adjacent
-    rows in a 8192-row sorted group differ in length by well under 1%, which is
-    why sequence packing is not worth its complexity here.
+    Sorting within a large group first is what keeps padding at a couple of percent
+    -- adjacent rows in a 8192-row sorted group differ in length by well under 1%,
+    which is why sequence packing is not worth its complexity here.
+
+    This is HF's `LengthGroupedSampler` scheme, and its known consequence is that
+    consecutive steps walk one group from longest to shortest. `plan_epoch` fixes
+    that with `shuffle_micro_steps`; the grouping itself is untouched, so the SFT
+    campaigns keep the exact batches they trained on.
     """
     batches: list[list[int]] = []
     for start in range(0, order.size, group_size):
         group = order[start : start + group_size]
         group = group[np.argsort(-lengths[group], kind="stable")]
-        current: list[int] = []
-        widest = 0
-        for index in group.tolist():
-            candidate = max(widest, int(lengths[index]))
-            full = current and (
-                candidate * (len(current) + 1) > max_batch_tokens
-                or len(current) >= max_sequences
-            )
-            if full:
-                batches.append(current)
-                current, candidate = [], int(lengths[index])
-            current.append(int(index))
-            widest = candidate
-        if current:
-            batches.append(current)
+        batches += _pack(group.tolist(), lengths, max_batch_tokens, max_sequences)
     return batches
+
+
+def _bucketed_micro_batches(
+    order: np.ndarray,
+    lengths: np.ndarray,
+    max_batch_tokens: int,
+    max_sequences: int,
+    bucket_rows: int,
+    rng: np.random.Generator,
+) -> list[list[int]]:
+    """Global length sort, then shuffle rows inside each bucket before packing.
+
+    Two measured trades, both on the encoder's 175,928-row plan:
+
+    * sorting **globally** rather than within 8192-row groups drops padding from
+      0.3% to 0.0%, because a micro-batch's rows are then the nearest in length in
+      the whole epoch rather than the nearest within a random pool;
+    * shuffling inside a 1024-row bucket costs 1.1% padding (and ~1% of epoch
+      time) and buys the thing the strict sort cannot: a row's micro-batch
+      companions stop being a deterministic function of its length.
+
+    Bucket width is the dial between those two. It is *not* a dial for domain
+    diversity -- domain is nearly a function of length in this corpus, so the
+    bucket's length range fixes its domain mix no matter how the rows inside it are
+    permuted. Diversity within an optimizer step comes from accumulating several
+    micro-steps (`target_global_batch`), not from here.
+    """
+    ordered = order[np.argsort(-lengths[order], kind="stable")]
+    batches: list[list[int]] = []
+    for start in range(0, ordered.size, bucket_rows):
+        bucket = ordered[start : start + bucket_rows]
+        bucket = bucket[rng.permutation(bucket.size)]
+        batches += _pack(bucket.tolist(), lengths, max_batch_tokens, max_sequences)
+    return batches
+
+
+def _shuffle_micro_steps(
+    micro: list[list[int]], world_size: int, rng: np.random.Generator
+) -> list[list[int]]:
+    """Shuffle whole micro-steps: `world_size` consecutive micro-batches at a time.
+
+    Blocks, never individual micro-batches. The `world_size` micro-batches of one
+    micro-step run concurrently and synchronize on every micro-batch -- the encoder
+    all-reduces code counts inside `forward` -- so every rank waits for the slowest
+    one. Keeping them adjacent in the sorted order keeps them the same size:
+    measured on the encoder plan with the probe's own per-micro-batch timings,
+    shuffling individual micro-batches instead costs 1.6x wall clock (5.4 -> 8.5
+    h/rank per epoch) for identical work. This is fairseq's `grouped_shuffling`,
+    "shuffle batches in groups of num_shards to enable similar sequence lengths on
+    each GPU worker when batches are sorted by length".
+    """
+    steps = [micro[i : i + world_size] for i in range(0, len(micro), world_size)]
+    return [batch for index in rng.permutation(len(steps)) for batch in steps[index]]
 
 
 def plan_epoch(
@@ -175,19 +253,41 @@ def plan_epoch(
     if budget is not None:
         order = order[:budget]
 
-    micro = _greedy_micro_batches(
-        order=order,
-        lengths=lengths,
-        max_batch_tokens=int(training.max_batch_tokens),
-        max_sequences=int(training.micro_batch_max_sequences),
-        group_size=int(training.length_group_size),
-    )
+    # `length_bucket_rows` supersedes `length_group_size`: it sorts globally, so a
+    # group size would have nothing left to mean.
+    bucket_rows = optional_int(training.get("length_bucket_rows"))
+    if bucket_rows is not None:
+        micro = _bucketed_micro_batches(
+            order=order,
+            lengths=lengths,
+            max_batch_tokens=int(training.max_batch_tokens),
+            max_sequences=int(training.micro_batch_max_sequences),
+            bucket_rows=bucket_rows,
+            rng=rng,
+        )
+    else:
+        micro = _greedy_micro_batches(
+            order=order,
+            lengths=lengths,
+            max_batch_tokens=int(training.max_batch_tokens),
+            max_sequences=int(training.micro_batch_max_sequences),
+            group_size=int(training.length_group_size),
+        )
     # Ragged tail dropped so every rank has a micro-batch in every micro-step.
     micro = micro[: (len(micro) // world_size) * world_size]
+    shuffle_micro_steps = bool(training.get("shuffle_micro_steps", False))
+    if shuffle_micro_steps:
+        # Its own stream, not `rng`: the bucket shuffle above has already advanced
+        # that one by a data-dependent number of draws, and the batch order should
+        # not change because the length distribution did.
+        micro = _shuffle_micro_steps(
+            micro, world_size, np.random.default_rng([int(training.seed), epoch, 1])
+        )
 
     target = int(training.target_global_batch)
     steps: list[tuple[int, int]] = []
     denom: list[int] = []
+    rows: list[int] = []
     start, sequences, tokens = 0, 0, 0
     for cursor in range(0, len(micro), world_size):
         for batch in micro[cursor : cursor + world_size]:
@@ -196,6 +296,7 @@ def plan_epoch(
         if sequences >= target or cursor + world_size == len(micro):
             steps.append((start, cursor + world_size))
             denom.append(tokens)
+            rows.append(sequences)
             start, sequences, tokens = cursor + world_size, 0, 0
 
     payload = "|".join(
@@ -214,6 +315,12 @@ def plan_epoch(
             int(lengths.sum()),
         )
     )
+    # Appended only when set, so a plan built by the pre-bucketing code hashes to
+    # exactly what it did before and the SFT campaigns still resume.
+    if bucket_rows is not None:
+        payload += f"|bucket{bucket_rows}"
+    if shuffle_micro_steps:
+        payload += "|shuffled"
     return BatchPlan(
         micro=micro,
         steps=steps,
@@ -221,6 +328,7 @@ def plan_epoch(
         dropped=dropped,
         kept=int(order.size),
         signature=hashlib.sha256(payload.encode()).hexdigest()[:16],
+        rows=rows,
     )
 
 
@@ -279,15 +387,6 @@ class ChunkedCELM(torch.nn.Module):
         self.model = model
         self.chunk_tokens = chunk_tokens
 
-    def _chunk_loss(self, hidden: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        logits = self.model.lm_head(hidden)
-        return F.cross_entropy(
-            logits.float(),
-            targets,
-            ignore_index=IGNORE_INDEX,
-            reduction="sum",
-        )
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -298,19 +397,126 @@ class ChunkedCELM(torch.nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
         ).last_hidden_state
-        hidden = hidden[:, :-1].flatten(0, 1)
-        targets = labels[:, 1:].flatten()
+        return chunked_ce_from_hidden(
+            self.model.lm_head, hidden, labels, self.chunk_tokens
+        )
 
-        total = hidden.new_zeros((), dtype=torch.float32)
-        for start in range(0, hidden.size(0), self.chunk_tokens):
-            stop = start + self.chunk_tokens
-            total = total + checkpoint(
-                self._chunk_loss,
-                hidden[start:stop],
-                targets[start:stop],
-                use_reentrant=False,
-            )
-        return total
+
+def chunked_ce_from_hidden(
+    lm_head: Any,
+    hidden: torch.Tensor,
+    labels: torch.Tensor,
+    chunk_tokens: int,
+    select_labels: bool = False,
+) -> torch.Tensor:
+    """Shifted cross-entropy over `hidden`, in slices, returning a SUM.
+
+    Split out of `ChunkedCELM` so the encoder path -- which reaches the same
+    hidden states through `inputs_embeds` rather than `input_ids` -- reuses this
+    rather than reimplementing the memory argument. The shift happens once, before
+    chunking, so no chunk boundary can introduce an off-by-one.
+
+    `select_labels` drops ignored positions before `lm_head`. Mathematically a
+    no-op -- `ignore_index` already contributes zero -- but it decides how much
+    work happens, and the right answer differs by caller:
+
+    * SFT supervises the whole assistant turn, ~98% of positions, so selecting
+      would save nothing and it stays off by default;
+    * the encoder supervises the **answer only**, a measured 21.8% of the
+      compressed render, so leaving it off runs `lm_head` and the fp32 logit
+      upcast over 4.6x more positions than carry a label.
+    """
+    hidden = hidden[:, :-1].flatten(0, 1)
+    targets = labels[:, 1:].flatten()
+    if select_labels:
+        keep = (targets != IGNORE_INDEX).nonzero(as_tuple=True)[0]
+        hidden = hidden.index_select(0, keep)
+        targets = targets.index_select(0, keep)
+    return chunked_ce_flat(lm_head, hidden, targets, chunk_tokens)
+
+
+def chunked_ce_flat(
+    lm_head: Any,
+    hidden: torch.Tensor,
+    targets: torch.Tensor,
+    chunk_tokens: int,
+) -> torch.Tensor:
+    """Cross-entropy over ALREADY-PAIRED `[N, d]` states and `[N]` targets, as a SUM.
+
+    The shift-free core of `chunked_ce_from_hidden`. Split out because the encoder's
+    next-patch head pairs states with targets by an explicit *gather* -- the state
+    predicting a patch's first token is its preceding code, not the position before
+    it -- so the one-position shift baked into the caller above does not apply.
+
+    Chunked and checkpointed for the same reason either way: `lm_head` materializes
+    `[chunk, 151936]` fp32 logits, and the encoder's aux path runs it over ~16x more
+    positions than the answer does.
+    """
+
+    def chunk_loss(part: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(
+            lm_head(part).float(),
+            target,
+            ignore_index=IGNORE_INDEX,
+            reduction="sum",
+        )
+
+    total = hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, hidden.size(0), chunk_tokens):
+        stop = start + chunk_tokens
+        total = total + checkpoint(
+            chunk_loss, hidden[start:stop], targets[start:stop], use_reentrant=False
+        )
+    return total
+
+
+def chunked_ce_weighted(
+    lm_head: Any,
+    hidden: torch.Tensor,
+    targets: torch.Tensor,
+    weights: torch.Tensor,
+    chunk_tokens: int,
+) -> torch.Tensor:
+    """`[sum(w * CE), sum(CE)]` over already-paired `[N, d]` states and `[N]` targets.
+
+    Two reductions of one `reduction="none"` cross-entropy, because the encoder needs
+    both and a second pass over `lm_head` is the most expensive thing in the step:
+
+    * the **weighted** sum is the objective. Per-row means are just per-token weights
+      (`1/A_i` for answer tokens, `1/(P_i * T_ij)` for next-patch targets), so the
+      whole per-row normalization lives in `weights` and nothing here knows about it;
+    * the **plain** sum is the token-weighted metric twin, free in this pass.
+
+    Only the first carries a gradient the caller uses, and since both come from the
+    same CE tensor they cannot disagree about what was scored. Chunked and
+    checkpointed exactly like `chunked_ce_flat`: `lm_head` materializes
+    `[chunk, 151936]` fp32 logits.
+    """
+
+    def chunk_loss(
+        part: torch.Tensor, target: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        # `ignore_index` contributes exactly 0 under reduction="none", so an ignored
+        # position is absent from both sums without being selected out here.
+        losses = F.cross_entropy(
+            lm_head(part).float(),
+            target,
+            ignore_index=IGNORE_INDEX,
+            reduction="none",
+        )
+        return torch.stack([(losses * weight).sum(), losses.sum()])
+
+    total = hidden.new_zeros(2, dtype=torch.float32)
+    for start in range(0, hidden.size(0), chunk_tokens):
+        stop = start + chunk_tokens
+        total = total + checkpoint(
+            chunk_loss,
+            hidden[start:stop],
+            targets[start:stop],
+            weights[start:stop],
+            use_reentrant=False,
+        )
+    return total
 
 
 # The fields that make a checkpoint a *different model* rather than a later step

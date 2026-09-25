@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from pathlib import Path
@@ -18,7 +19,16 @@ def _wandb_id(cfg: DictConfig) -> str:
     checkpoint directory -- i.e. they are the same run by construction.
     """
     name = str(cfg.get("run_name", None) or cfg.logging.get("name", None) or "run")
-    return re.sub(r"[^A-Za-z0-9_.-]", "-", name)[:63]
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", name)
+    if len(safe) <= 63:
+        return safe
+    # W&B ids cap at 64 characters. Truncating alone collapses every run name that
+    # differs only past character 63 onto ONE W&B run -- with the encoder's
+    # run_name that is the masks, the position encoding and the lr -- and
+    # resume="allow" then appends one arm's history to another's. A readable
+    # prefix plus a hash of the WHOLE name keeps ids unique; names that already
+    # fit are unchanged, so existing runs keep their ids.
+    return f"{safe[:54]}-{hashlib.sha1(safe.encode()).hexdigest()[:8]}"
 
 
 class RunLogger:

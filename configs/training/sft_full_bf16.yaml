@@ -30,6 +30,18 @@ max_batch_tokens: 32768
 # padding but a coarser shuffle.
 length_group_size: 8192
 micro_batch_max_sequences: 16
+
+# The two knobs that replace `length_group_size` when set. Off here, so this
+# recipe keeps the exact batches the 4B and 0.6B campaigns trained on -- both
+# enter `plan_signature` only when non-default, so those checkpoints still resume.
+#
+#   length_bucket_rows: sort globally, then shuffle rows inside buckets of this
+#     many before packing, so a row's micro-batch companions are not a
+#     deterministic function of its length.
+#   shuffle_micro_steps: shuffle whole micro-steps (world_size micro-batches at a
+#     time) so steps stop marching from the longest rows to the shortest.
+length_bucket_rows: null
+shuffle_micro_steps: false
 # Sequences per optimizer step, summed across ranks. Accumulation runs until this
 # is reached, so gradient_accumulation_steps is derived, not configured.
 #

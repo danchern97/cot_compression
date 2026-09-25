@@ -14,6 +14,10 @@ num_workers: 14
 # In-flight samples per worker; bounds prep memory (num_workers * this * ~sample).
 prefetch_factor: 4
 max_examples: null
+# Which split to score, named semantically: "validation" resolves to the SFT
+# corpus's `eval` split and the trace corpus's `val` split. Phase 1 scores `test`;
+# leave it unset for in-training evaluation.
+split: null
 metric: answer_logprob
 normalize_by_length: true
 save_token_logprobs: true
@@ -25,6 +29,11 @@ entropy_cache_dir: null
 # Which per-token signals `precompute` computes and caches. Both come from one
 # forward pass, so caching both is nearly free.
 precompute_signals: [entropy, surprisal]
+# Shard the precompute across jobs. Rows split into contiguous disjoint ranges;
+# each shard writes to <cache_dir>/shards/ and `merge_traces` assembles them.
+# num_shards=1 writes the final cache directly, so nothing changes for small runs.
+shard: 0
+num_shards: 1
 # Optional scratch mirror. When set, the large tokens.jsonl (and answer-entropy
 # npz) are written ONLY under <scratch_dir>/<job>/artifacts, while the small
 # summary.json/samples.jsonl go to both the run dir and here. Keeps the ~0.7 GB/
@@ -61,3 +70,12 @@ methods:
     # softmax(ln(-log p) / T) pooling temperature: T=1 -> weight by surprisal
     # share, T=0 -> keep only the highest-surprisal token per patch.
     temperature: 1.0
+  # The trained compressor, scored on the same rows and under the same join key
+  # as everything above. `patching` must match what the encoder was trained with:
+  # the checkpoint fixes the architecture and the latent init, but K comes from
+  # here, and scoring at a ratio the encoder never saw would compare two things.
+  learned:
+    patching: uniform
+    # Directory holding encoder.pt + encoder_config.json, e.g.
+    # <run_dir>/checkpoints/best. Null => `learned` cannot be enabled.
+    checkpoint: null

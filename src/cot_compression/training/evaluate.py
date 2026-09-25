@@ -26,10 +26,12 @@ from cot_compression.compression import (
 from cot_compression.data.answers import (
     cot_token_ids,
     extract_answer_trace,
+    prefix_token_ids,
     tokenize_answer,
 )
 from cot_compression.data.chat import IGNORE_INDEX
 from cot_compression.data.dolci import load_dolci_sft_data
+from cot_compression.data.dolci_traces import load_trace_data
 from cot_compression.signals import (
     compute_cot_signals,
     load_signal_cache,
@@ -240,6 +242,9 @@ class PreparedSample:
     compression_ratio: float | None
     slot_positions: list[int] = field(default_factory=list)
     slot_embeddings: torch.Tensor | None = None
+    # Populated only when the method declares requires_prefix(): rendering the
+    # prompt through the chat template is not free at eval scale.
+    prefix_ids: list[int] | None = None
 
 
 class PrepDataset(TorchDataset["PreparedSample | None"]):
@@ -369,7 +374,45 @@ class PrepDataset(TorchDataset["PreparedSample | None"]):
             compression_ratio=(num_slots if num_slots is not None else len(cot_ids))
             / len(cot_ids),
             slot_positions=slot_positions,
+            prefix_ids=(
+                prefix_token_ids(trace, self.tokenizer)
+                if self.method.requires_prefix()
+                else None
+            ),
         )
+
+
+def load_eval_dataset(cfg: DictConfig) -> Any:
+    """The rows to score, from whichever corpus `data.loader` names.
+
+    `evaluation.split` is semantic rather than literal -- "validation" maps to the
+    SFT corpus's `eval` split and the trace corpus's `val` split -- so callers ask
+    for what they mean and neither corpus's naming leaks into config files.
+
+    Phase 1 scores `test`; in-training eval scores `validation`. Scoring the split
+    a model selected checkpoints on would report a number that is not held out.
+    """
+    # `val` is the trace corpus's own split name and must work: insulating configs
+    # from corpus naming is not worth an error for spelling the split the way the
+    # dataset does.
+    split = str(cfg.evaluation.get("split") or "validation")
+    split = "validation" if split == "val" else split
+    loader = str(cfg.data.get("loader", "dolci_sft"))
+    if loader == "traces":
+        data = load_trace_data(cfg)
+        available = {"train": data.train, "validation": data.val, "test": data.test}
+    elif loader == "dolci_sft":
+        sft = load_dolci_sft_data(cfg)
+        available = {"train": sft.train, "validation": sft.eval, "test": sft.test}
+    else:
+        raise ValueError(
+            f"Unknown data.loader {loader!r}; expected traces or dolci_sft."
+        )
+    if split not in available:
+        raise ValueError(
+            f"Unknown evaluation.split {split!r}; expected one of {sorted(available)}."
+        )
+    return available[split]
 
 
 def build_eval_model_and_tokenizer(
@@ -928,6 +971,7 @@ def evaluate_method(
                     name: cot_signals[name].get(prepared.sample_index)
                     for name in required_signals
                 },
+                prepared.prefix_ids,
             )
         except ValueError:
             # Patching/pooling wanted a signal this sample has none of, which the
@@ -971,7 +1015,7 @@ def evaluate_methods(cfg: DictConfig) -> Path:
         logger.info(f"Using device: {device}")
 
         methods = build_compression_methods(cfg)
-        dataset = load_dolci_sft_data(cfg).eval
+        dataset = load_eval_dataset(cfg)
 
         artifact_dir = run_dir / "artifacts"
         artifact_dir.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,139 @@
+# Baseline compressor: the minimal configuration. Every field here that could be
+# something else is an ablation, not a default waiting to be tuned.
+
+# Depth. Each block is an Attention-Is-All-You-Need decoder block (masked
+# self-attn -> cross-attn -> FFN) with the output head removed.
+n_blocks: 2
+n_heads: 8
+ffn_mult: 4
+
+# No dimensionality projection anywhere: d_model == d_code == the decoder's
+# hidden size, which is read from the loaded decoder and never set here. So the
+# codebook lives directly in the decoder's input-embedding space and a code IS a
+# spliced embedding.
+#
+# Consequence to keep in mind before running Qwen3-4B: encoder capacity is tied
+# to decoder width, ~34M parameters at d=1024 but ~210M at d=2560, which would
+# confound any 0.6B-vs-4B comparison.
+codebook_size: 64
+
+# none | rope. Ordinary rotary encodings on Q and K in both attentions, each in the
+# coordinate system it works in: the latent self-attention numbers slot j as j,
+# while the cross-attention uses Pass A token indices on both sides -- memory
+# column m is token m, and slot i queries from its span's LAST token
+# (`cross_limit - 1`). `CoTEncoder.rope_positions` argues the choice.
+#
+# Not an ablation waiting to be tried: without it a slot can only find its own span
+# in the memory by content match, since the memory is the decoder's post-norm
+# hidden states and carries no position a dot product can read. "none" exists so
+# that checkpoints trained before this keep their own semantics.
+position_encoding: rope
+# 1e6, the decoder's own value, not RoFormer's 10,000. Men et al. (arXiv:2405.14591,
+# Table 2) put the lower bound for 32k context at 6.4e5 at head_dim 128 -- exactly
+# this encoder's head dim -- and max_length is 32,768.
+rope_theta: 1000000.0
+
+# causal | bidirectional, independently for each.
+# `self=causal, cross=bidirectional` is AIAYN-style (its decoder sees the whole
+# source); `causal/causal` is the fully autoregressive-compatible setting.
+# Note the memory comes from a causal decoder, so `cross=bidirectional` lets an
+# early latent read a contextualized view of the WHOLE trace -- it is the setting
+# where answer-code cheating is easiest.
+self_attn_mask: causal
+cross_attn_mask: causal
+
+# random | simple_mean | surprisal_t0. All three are existing training-free
+# compression methods reused as initializers, so step-0 behaviour is a measured
+# baseline rather than a new one. `random` draws one regular-vocab embedding per
+# slot, keyed on seed + sample_index.
+latent_init: random
+
+# Training-free CONTROLS, scored once on the eval slice at startup and reported at
+# every eval as eval/<name>_{row,tok} -- constants, logged each time so one chart
+# can overlay them on eval/answer_ce_{row,tok} -- beside the
+# `base` (full trace) and `no_cot` (empty think block) bounds. Each goes through the
+# encoder's own row preparation -- same spans, same K, same splice positions -- with
+# every slot set to that latent initializer's token embedding and no encoder:
+#   random        arbitrary regular-vocabulary tokens: do the codes' CONTENTS matter?
+#   surprisal_t0  each span's highest-surprisal token, i.e. surprisal_weighted_mean
+#                 compression at T=0: does the encoder beat the method it starts from?
+# `surprisal_t0` reads the surprisal cache, so it needs evaluation.entropy_cache_dir
+# and a patching whose signal (if any) is also surprisal.
+eval_controls: [random, surprisal_t0]
+
+# Which decoder layer supplies the cross-attention memory. -1 is the final
+# (post-norm) hidden state; verified that hidden_states[-1] is last_hidden_state
+# on the installed transformers, so other layers index consistently.
+memory_layer: -1
+
+# Patching decides K and nothing else. `uniform` needs no per-token signal and so
+# no precompute; the signal strategies need one and are not wired yet.
+patching: uniform
+
+# VQ. Gradient-trained codebook (not EMA), so it is a plain nn.Parameter that DDP
+# all-reduces like any other weight.
+#
+# beta IS scale-free now: each row's quantizer terms are means over that row's own
+# slots, so their magnitude no longer scales with slots-per-answer-token (~(L/rho)/A)
+# the way it did when everything was divided by the step's answer tokens. 0.25 is
+# VQ-VAE's value and now means what it does there.
+commit_weight: 0.25
+
+# Auxiliary next-patch supervision: from [prompt; z_0..z_j], predict the tokens of
+# patch j+1, teacher-forced, through the frozen decoder. It exists because answer
+# likelihood alone supervises 0.247 tokens per latent slot -- which is why the
+# held-out gap moves at ~+0.009/1000 steps and barely responds to codebook quality.
+# This raises supervised tokens per step from 20k to ~325k.
+#
+# Now a ratio between two comparable numbers: a row's mean per-patch CE against its
+# mean answer CE, each averaged over rows. It no longer folds in the aux/answer
+# TOKEN ratio -- 13.8x on this corpus, and 2-29x from step to step -- which is what
+# put the sawtooth in `train/loss` and left the answer likelihood ~0.5% of the
+# gradient at 1.0. Values from before that change do NOT transfer.
+#
+# MEASURED at step 5 of the first run under this objective (job 26871004): per-row
+# answer CE 0.678 against per-row per-patch CE 8.753, so 1.0 still leaves the aux
+# term 12.9x the answer term -- 93% of the objective rather than the old 99.5%.
+# Roughly 0.08 would balance the two; 1.0 keeps the original experiment (does
+# next-patch supervision produce codes that transfer?) rather than balancing them.
+#
+# Answer likelihood remains the *reported* metric and what `best/` selects on.
+# 0.0 removes the term and skips the pass in training; eval still computes it, so
+# an answer-only run reports how well its codes predict the next patch.
+next_patch_weight: 1.0
+
+# Probability that a patch is supervised, keyed on seed + sample_index. Dropping a
+# patch removes its tokens from the sequence, so this scales the decoder cost, not
+# just the lm_head -- it is the dial if ~3x per step proves too slow. 1.0 supervises
+# every patch. Patch 0 is never supervised: it has no preceding code.
+next_patch_subsample: 1.0
+
+# EnCodec's `threshold_ema_dead_code`: a code is dead below this ABSOLUTE usage
+# EMA count. Absolute, and 2, because that is what the references use (Jukebox
+# 1.0, SoundStream/EnCodec/lucidrains 2). Not scale-free -- 2 is 4.2% of a code's
+# fair share at |C|=1024 but 0.26% at |C|=64 -- so codebook-health metrics are not
+# comparable across codebook sizes. Accepted deliberately over a homemade rule.
+dead_code_threshold: 2.0
+usage_decay: 0.99
+
+# Codebook initialization: k-means over the encoder's outputs on the plan's first
+# micro-batches -- as many as it takes to reach the 65,536-sample target, since a
+# shuffled plan opens on a random length rather than the longest rows
+# (SoundStream/EnCodec, which ships `kmeans_iters=50`). This is what makes restarts
+# safe -- the codebook and the vectors it quantizes are one distribution from step
+# 0, so the dead set is a handful rather than a majority. It works here only
+# because `embed_rms` puts the encoder's outputs at the decoder's embedding scale;
+# with the previous vocabulary-embedding init the two were 34x apart and 46 of 64
+# codes were dead from step 1.
+kmeans_iters: 50
+
+# Jukebox-style random restarts: a dead code is overwritten with a live encoder
+# output. Every step, no warmup and no interval -- matching Jukebox, EnCodec,
+# lucidrains and vqtorch, all of which replace on every forward. Batching
+# replacement into periodic events is what Huh et al. (arXiv:2305.08842) identify
+# behind restart-induced loss spikes; it took this run from 1.11 to 18.0 at step
+# 200.
+reseed_dead_codes: true
+# > 0 softens argmin into a weighted average of codes. An early-collapse
+# mitigation to reach for once utilization is measured to be failing, not before.
+soft_assign_temperature: 0.0

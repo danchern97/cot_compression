@@ -1,0 +1,31 @@
+# @package _global_
+
+# Prepare the compression-trace corpus: grouped domain-stratified split, then
+# per-row token counts. Both stages run here because they are one operational
+# step on the same (CPU-only) hardware -- submit to `rome`/`genoa`, not a GPU node.
+#
+# Kept out of encoder training for the same reason `tokenize` is kept out of
+# `sft_train`: under tasks_per_node > 1 several ranks would race on one cache.
+#
+# The source repo is private. Requires a read-scoped HF token with access to the
+# dl-students organization; an OAuth token from a browser login is not enough and
+# fails with a bare 404.
+
+defaults:
+  - /paths: default
+  - /data: dolci_compression_traces
+  - /method: qwen3/0_6b
+  - /logging: wandb
+  - _self_
+
+mode: prepare_traces
+
+logging:
+  enabled: false
+  log_file_name: prepare_traces.log
+
+hydra:
+  run:
+    dir: ${paths.light_dir}/prepare_traces/${data.name}/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: false

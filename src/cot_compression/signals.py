@@ -239,3 +239,39 @@ def compute_cot_signals(
             for name in signals:
                 result[name][sample_index] = values[name][row, span].cpu()
     return result
+
+
+def merge_signal_shards(
+    cache_dir: Path, model_name: str, signal: str, num_shards: int
+) -> Path:
+    """Assemble a full signal cache from shard files, or refuse.
+
+    Shards carry each row's index in the *full* split, so merging is a dict union
+    with no renumbering -- but that also means a missing shard produces a cache
+    that is silently short rather than malformed. Every shard is therefore required
+    to be present, and no row may appear twice.
+    """
+    shard_dir = cache_dir / "shards"
+    merged: dict[int, torch.Tensor] = {}
+    for shard in range(num_shards):
+        path = signal_cache_path(shard_dir, model_name, signal).with_suffix(
+            f".shard{shard:02d}of{num_shards:02d}.npz"
+        )
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Shard {shard} of {num_shards} is missing at {path}. Merging an "
+                "incomplete set would produce a cache that is short rather than "
+                "broken, which nothing downstream would notice."
+            )
+        values = load_signal_cache(path)
+        overlap = merged.keys() & values.keys()
+        if overlap:
+            raise ValueError(
+                f"Shard {shard} re-claims {len(overlap)} rows already present "
+                f"(e.g. {sorted(overlap)[:3]}). The shard ranges are not disjoint."
+            )
+        merged.update(values)
+
+    out = signal_cache_path(cache_dir, model_name, signal)
+    save_signal_cache(out, merged)
+    return out

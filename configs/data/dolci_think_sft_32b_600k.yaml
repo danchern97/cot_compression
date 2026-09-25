@@ -9,3 +9,6 @@ test_size: 100000
 seed: 1337
 # Worker processes for the one-off pre-tokenization pass (CPU partition).
 tokenize_num_proc: 60
+
+# Which corpus loader `evaluation` reads. See training.evaluate.load_eval_dataset.
+loader: dolci_sft

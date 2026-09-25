@@ -1,0 +1,22 @@
+name: dolci_compression_traces
+source_name: dl-students/dolci-compression-traces
+source_config: null
+# The repo declares one `train` split spanning all six parquet files
+# (data/qwen3-0.6b/{base,fulfillment}-{math,code,other}.parquet); the three-way
+# split below is produced here, not by the source.
+source_split: train
+prepared_dir: ${paths.data_dir}/dolci_compression_traces
+
+# Fractions over PROMPT GROUPS, not rows. Group sizes vary and val/test keep one
+# trace per prompt, so a 90/5/5 prompt split reads as ~95/2.7/2.7 by row -- that
+# is expected, and build_trace_data prints both.
+train_fraction: 0.90
+val_fraction: 0.05
+test_fraction: 0.05
+seed: 1337
+
+# Worker processes for the one-off pre-tokenization pass (CPU partition).
+tokenize_num_proc: 60
+
+# Read by `evaluation` through load_trace_data, not load_dolci_sft_data.
+loader: traces

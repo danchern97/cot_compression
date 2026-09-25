@@ -523,6 +523,79 @@ def test_plan_denominator_is_the_exact_supervised_token_count() -> None:
         assert denom == expected
 
 
+def test_bucketed_shuffled_plan_keeps_every_row_and_stays_rank_safe() -> None:
+    """The new batch order must change nothing about what is trained on, only when.
+
+    Bucketing and micro-step shuffling touch the two invariants DDP and the epoch
+    depend on: every row exactly once, and a micro-batch for every rank in every
+    micro-step.
+    """
+    rng = np.random.default_rng(11)
+    lengths = rng.integers(4, 60, 400)
+    starts = (lengths // 3).astype(np.int64)
+    cfg = _plan_cfg(length_bucket_rows=32, shuffle_micro_steps=True)
+
+    plan = plan_epoch(lengths, starts, cfg, epoch=0, world_size=4)
+    flat = [index for batch in plan.micro for index in batch]
+    assert len(flat) == len(set(flat)), "a row appeared twice in one epoch"
+    assert len(plan.micro) % 4 == 0
+    assert all((stop - start) % 4 == 0 for start, stop in plan.steps)
+    # `rows` is what the per-row objective divides by, so it must be the real count.
+    for (start, stop), rows in zip(plan.steps, plan.rows, strict=True):
+        assert rows == sum(len(b) for b in plan.micro[start:stop])
+
+    # Deterministic given the seed, and a different epoch is a different order.
+    again = plan_epoch(lengths, starts, cfg, epoch=0, world_size=4)
+    other = plan_epoch(lengths, starts, cfg, epoch=1, world_size=4)
+    assert plan.micro == again.micro and plan.signature == again.signature
+    assert plan.micro != other.micro
+
+    # Shuffled, not merely re-sorted: the steps must stop marching from the longest
+    # rows to the shortest, which is what the length-grouped order did.
+    longest = [max(int(lengths[i]) for i in plan.micro[s]) for s, _ in plan.steps]
+    assert longest != sorted(longest, reverse=True)
+
+    # Within a micro-step the ranks still get similar lengths -- that is what keeps
+    # three ranks from waiting on a fourth.
+    spread = [
+        max(max(lengths[b]) for b in plan.micro[i : i + 4])
+        / min(max(lengths[b]) for b in plan.micro[i : i + 4])
+        for i in range(0, len(plan.micro), 4)
+    ]
+    assert np.median(spread) < 1.5
+
+
+def test_legacy_plan_signature_is_unchanged_by_the_new_knobs() -> None:
+    """The SFT campaigns must still resume: same knobs, same hash as before.
+
+    `length_bucket_rows` and `shuffle_micro_steps` enter the payload only when set,
+    so a plan built with them at their defaults hashes to what it always did. The
+    literal below is that historical value, taken from the committed formula
+    (`sha256("7|0|1|64|64|2|8|4|None|64|640")[:16]`); if this fails, every existing
+    SFT checkpoint has just become unresumable.
+    """
+    lengths = np.full(64, 10, dtype=np.int64)
+    starts = np.full(64, 2, dtype=np.int64)
+    legacy = plan_epoch(lengths, starts, _plan_cfg(), epoch=0, world_size=1)
+    assert legacy.signature == "82472fa4ffdd1f06"
+    assert (
+        plan_epoch(
+            lengths,
+            starts,
+            _plan_cfg(length_bucket_rows=None, shuffle_micro_steps=False),
+            epoch=0,
+            world_size=1,
+        ).signature
+        == legacy.signature
+    )
+    # And each new knob moves it, so a resume can never silently change the order.
+    for override in ({"length_bucket_rows": 8}, {"shuffle_micro_steps": True}):
+        changed = plan_epoch(
+            lengths, starts, _plan_cfg(**override), epoch=0, world_size=1
+        )
+        assert changed.signature != legacy.signature, override
+
+
 def test_plan_signature_changes_with_the_batching_knobs() -> None:
     lengths = np.full(64, 10, dtype=np.int64)
     starts = np.full(64, 2, dtype=np.int64)
@@ -1100,3 +1173,27 @@ def test_token_writer_reraises_writer_thread_failure(tmp_path) -> None:
         for index in range(100):
             writer.submit(json.dumps("base"), index, [1], [2], [-1.0])
             time.sleep(0.001)
+
+
+def test_exit_failed_rank_flushes_then_hard_exits(monkeypatch):
+    """A failed rank must END, not unwind into a teardown that waits on its peers.
+
+    `os._exit` is what makes srun's SLURM_KILL_BAD_EXIT fire (job 26697398 sat idle
+    after an injected fault because the raising rank never exited). Asserted with the
+    exit intercepted, since a real `os._exit` would end the test process.
+    """
+    import cot_compression.training.utils as utils
+
+    codes: list[int] = []
+
+    class Exited(BaseException):
+        pass
+
+    def fake_exit(code: int) -> None:
+        codes.append(code)
+        raise Exited
+
+    monkeypatch.setattr(utils.os, "_exit", fake_exit)
+    with pytest.raises(Exited):
+        utils.exit_failed_rank(3)
+    assert codes == [1]

@@ -1,0 +1,25 @@
+# @package _global_
+
+defaults:
+  - /paths: default
+  - /data: dolci_think_sft_7b_600k
+  - /method: qwen3/0_6b
+  - /evaluation: answer_loss
+  - /logging: wandb
+  - _self_
+
+mode: merge_shards
+
+logging:
+  group: precompute
+  log_file_name: precompute.log
+  tags:
+    - qwen3
+    - dolci
+    - entropy-cache
+
+hydra:
+  run:
+    dir: ${paths.output_dir}/runs/precompute/${data.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true

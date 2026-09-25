@@ -39,7 +39,25 @@ setup:
   # allocator fragments badly at 32k-token sequences.
   - export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   - export OMP_NUM_THREADS=4
+  # FlexAttention JIT-compiles a Triton kernel, and Triton builds a small C
+  # extension that needs Python.h. The venv is built on /usr/bin/python3.11, which
+  # ships without its -devel headers, so the compile fails with "Python.h: No such
+  # file or directory" and takes the whole job with it (job 26425921). uv's
+  # standalone CPython does carry the headers, and 3.11.15 vs the venv's 3.11.13 is
+  # ABI-compatible -- verified by compiling against them.
+  # No `${...}` anywhere in this value: OmegaConf parses that as an interpolation
+  # and the whole launch dies with "Unsupported interpolation type CPATH". Set
+  # absolutely rather than appending; nothing else sets CPATH here.
+  - export CPATH=$HOME/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/include/python3.11
   - export TOKENIZERS_PARALLELISM=false
+  # One rank's exception must take the whole job down at once. Without this, srun
+  # leaves the surviving ranks inside a collective until the 30-minute NCCL
+  # watchdog fires -- how an InductorError on rank 3 became an unexplained timeout
+  # on ranks 0-2 (job 26474948). srun reads SLURM_KILL_BAD_EXIT like the flag.
+  - export SLURM_KILL_BAD_EXIT=1
+  # Compiled FlexAttention kernels persist across jobs, so each aux shape (89 at the
+  # configured width multiple) compiles once per campaign, not once per requeue.
+  - export TORCHINDUCTOR_CACHE_DIR=/scratch-shared/$USER/cot_compression/inductor_cache
   # The Qwen3-4B run died twice on a 30-minute NCCL ALLREDUCE watchdog timeout
   # and the root cause was never found, because FlightRecorder was off and the
   # only evidence was the watchdog message itself. These three cost nothing at

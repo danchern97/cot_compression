@@ -99,3 +99,148 @@ def test_hydra_configs_compose() -> None:
     assert sft_06b_cfg.run_tag == "qwen3-0.6b"
     assert sft_06b_cfg.run_tag != sft_cfg.run_tag
     assert sft_06b_cfg.paths.run_dir != sft_cfg.paths.run_dir
+
+
+def test_encoder_workflow_composes() -> None:
+    """The encoder campaign's defaults, and that the grid is reachable by override.
+
+    Pinned because two of these are silent failure modes rather than errors: a
+    shared `run_tag` would resolve the encoder run onto an SFT run's directory,
+    and truncating instead of dropping over-length rows would cut placeholder
+    slots off and desynchronize `slot_positions` from K.
+    """
+    config_dir = str(Path(__file__).resolve().parents[1] / "configs")
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        cfg = compose(
+            config_name="run",
+            overrides=["workflow=encoder_train", "logging.enabled=false"],
+        )
+        sft_cfg = compose(config_name="run", overrides=["logging.enabled=false"])
+
+        assert cfg.mode == "encoder_train"
+        assert cfg.data.name == "dolci_compression_traces"
+        assert cfg.method.model_name == "Qwen/Qwen3-0.6B"
+
+        # The settled baseline. Each of these is a deliberate choice documented in
+        # ENCODER_PLAN.md, not a value awaiting tuning.
+        assert cfg.encoder.n_blocks == 2
+        assert cfg.encoder.codebook_size == 64
+        assert cfg.encoder.latent_init == "random"
+        assert cfg.encoder.patching == "uniform"
+        assert cfg.encoder.memory_layer == -1
+        assert cfg.evaluation.methods.patching.compression_ratio == 4.0
+
+        # fp32 encoder masters (bf16 moments round updates away at these LRs);
+        # bf16 frozen decoder, which carries no optimizer state.
+        assert cfg.training.torch_dtype == "float32"
+        assert cfg.training.decoder_dtype == "bfloat16"
+
+        # Aux-pass compilation, sized from the census over this exact plan: an
+        # ADDITIVE width ladder (a power-of-two one doubled W and OOM'd) and a
+        # recompile limit that is fatal rather than a silent eager fallback.
+        assert cfg.training.aux_width_multiple == 1024
+        # Reported beside base/no_cot at every eval; renaming one renames its W&B key.
+        assert list(cfg.encoder.eval_controls) == ["random", "surprisal_t0"]
+        assert cfg.training.aux_recompile_limit == 128
+
+        # Positions. Not an ablation: without them a slot can only find its own
+        # span in the memory by content match. `run_name` carries the choice, so a
+        # rope arm and a none arm cannot resolve onto one directory.
+        assert cfg.encoder.position_encoding == "rope"
+        assert cfg.encoder.rope_theta == 1000000.0
+        assert "_perope_" in cfg.run_name
+        # The next-patch weight changes what is trained, so it must separate run
+        # directories too -- or an arm at another lambda with the same run_tag would
+        # resume this one's checkpoint.
+        assert "_np1.0_" in cfg.run_name
+
+        # Batch ORDER: global length sort, rows shuffled inside 1024-row buckets,
+        # and whole micro-steps shuffled -- the length-grouped default marched every
+        # step from the longest rows to the shortest. The bigger global batch is
+        # what lets one step span several length ranges (and so several domains).
+        assert cfg.training.length_bucket_rows == 1024
+        assert cfg.training.shuffle_micro_steps is True
+        assert cfg.training.target_global_batch == 128
+        # The SFT campaigns keep the batches they trained on, so their plan
+        # signature is unchanged and their checkpoints still resume.
+        assert sft_cfg.training.length_bucket_rows is None
+        assert sft_cfg.training.shuffle_micro_steps is False
+        assert sft_cfg.training.target_global_batch == 32
+
+        # run_name carries no model identifier, so the encoder run must not share
+        # a run_tag -- or resume_from_checkpoint=auto loads the wrong weights.
+        assert cfg.run_tag != sft_cfg.run_tag
+        assert cfg.paths.run_dir != sft_cfg.paths.run_dir
+
+        # All eight grid arms must be reachable by override alone, with distinct
+        # run directories so they cannot overwrite one another.
+        names = set()
+        for init in ("random", "surprisal_t0"):
+            for mask in ("causal", "bidirectional"):
+                for codes in (64, 1024):
+                    arm = compose(
+                        config_name="run",
+                        overrides=[
+                            "workflow=encoder_train",
+                            "logging.enabled=false",
+                            f"encoder.latent_init={init}",
+                            f"encoder.self_attn_mask={mask}",
+                            f"encoder.cross_attn_mask={mask}",
+                            f"encoder.codebook_size={codes}",
+                        ],
+                    )
+                    names.add(arm.run_name)
+        assert len(names) == 8, names
+
+
+def test_eval_split_selection_is_corpus_agnostic() -> None:
+    """`evaluation.split` is semantic, so neither corpus's naming leaks into config.
+
+    Phase 1 scores `test`; in-training eval scores `validation`. Getting this wrong
+    would report a number the model selected checkpoints on, which is not held out.
+    """
+    from unittest.mock import patch
+
+    from cot_compression.training.evaluate import load_eval_dataset
+
+    config_dir = str(Path(__file__).resolve().parents[1] / "configs")
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        traces = compose(
+            config_name="run",
+            overrides=[
+                "workflow=evaluate_methods",
+                "data=dolci_compression_traces",
+                "logging.enabled=false",
+            ],
+        )
+        sft = compose(
+            config_name="run",
+            overrides=["workflow=evaluate_methods", "logging.enabled=false"],
+        )
+
+    assert traces.data.loader == "traces"
+    assert sft.data.loader == "dolci_sft"
+    assert traces.evaluation.split is None  # => validation
+
+    class _Splits:
+        train, val, eval, test = "TRAIN", "VAL", "EVAL", "TEST"
+
+    with patch(
+        "cot_compression.training.evaluate.load_trace_data", return_value=_Splits()
+    ):
+        assert load_eval_dataset(traces) == "VAL"
+        traces.evaluation.split = "test"
+        assert load_eval_dataset(traces) == "TEST"
+
+    with patch(
+        "cot_compression.training.evaluate.load_dolci_sft_data", return_value=_Splits()
+    ):
+        assert load_eval_dataset(sft) == "EVAL"
+        sft.evaluation.split = "test"
+        assert load_eval_dataset(sft) == "TEST"
+        sft.evaluation.split = "nonsense"
+        try:
+            load_eval_dataset(sft)
+            raise AssertionError("expected an unknown-split error")
+        except ValueError as error:
+            assert "Unknown evaluation.split" in str(error)

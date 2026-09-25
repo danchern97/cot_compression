@@ -210,3 +210,57 @@ def test_legacy_entropy_cache_still_loads(tmp_path) -> None:
     assert set(loaded) == {0, 3}
     assert torch.allclose(loaded[0], torch.tensor([0.1, 0.2]))
     assert torch.allclose(loaded[3], torch.tensor([0.9]))
+
+
+def test_sharded_precompute_reconstructs_the_full_cache(tmp_path):
+    """Sharding must be lossless: disjoint, exhaustive, and merge-identical.
+
+    A missing shard yields a cache that is *short* rather than malformed, which
+    nothing downstream would notice -- so the merge refuses an incomplete set
+    rather than quietly producing one.
+    """
+    import numpy as np
+    import pytest
+
+    from cot_compression.signals import (
+        load_signal_cache,
+        merge_signal_shards,
+        save_signal_cache,
+        signal_cache_path,
+    )
+
+    rng = np.random.default_rng(0)
+    n_rows, n_shards = 37, 4
+    full = {
+        i: torch.tensor(rng.random(3 + i % 5), dtype=torch.float32)
+        for i in range(n_rows)
+    }
+
+    edges = np.linspace(0, n_rows, n_shards + 1).round().astype(int)
+    assert edges[0] == 0 and edges[-1] == n_rows, "ranges must be exhaustive"
+    covered = [i for s in range(n_shards) for i in range(edges[s], edges[s + 1])]
+    assert covered == list(range(n_rows)), "ranges must be disjoint and ordered"
+
+    shard_dir = tmp_path / "shards"
+    for s in range(n_shards):
+        rows = range(int(edges[s]), int(edges[s + 1]))
+        save_signal_cache(
+            signal_cache_path(shard_dir, "m/x", "surprisal").with_suffix(
+                f".shard{s:02d}of{n_shards:02d}.npz"
+            ),
+            {i: full[i] for i in rows},
+        )
+
+    merged = load_signal_cache(
+        merge_signal_shards(tmp_path, "m/x", "surprisal", n_shards)
+    )
+    assert merged.keys() == full.keys()
+    for i in full:
+        assert torch.allclose(merged[i], full[i]), i
+
+    # An incomplete set must raise, not silently produce a short cache.
+    signal_cache_path(shard_dir, "m/x", "surprisal").with_suffix(
+        f".shard01of{n_shards:02d}.npz"
+    ).unlink()
+    with pytest.raises(FileNotFoundError, match="incomplete"):
+        merge_signal_shards(tmp_path, "m/x", "surprisal", n_shards)

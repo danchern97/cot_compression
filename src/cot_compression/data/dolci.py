@@ -38,6 +38,28 @@ class DolciSFTData:
     test: Dataset
 
 
+def load_dataset_dict(path: Path) -> DatasetDict:
+    loaded = load_from_disk(str(path))
+    if not isinstance(loaded, DatasetDict):
+        raise ValueError(f"Expected a DatasetDict at {path}.")
+    return loaded
+
+
+def save_dataset_dict_atomic(dataset_dict: DatasetDict, out: Path) -> Path:
+    """Stage beside the target, then rename onto it.
+
+    A half-written cache that looks complete is worse than none: the next run
+    would load it and train on a truncated split. `os.replace` of a fully written
+    directory is the only step that publishes it.
+    """
+    staging = out.with_name(out.name + ".tmp")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    dataset_dict.save_to_disk(str(staging))
+    os.replace(staging, out)
+    return out
+
+
 def validate_messages(messages: object) -> list[Message]:
     if not isinstance(messages, list) or not messages:
         raise ValueError("Dolci examples must contain a non-empty messages list.")
@@ -147,10 +169,7 @@ def _prepare_subset(cfg: DictConfig) -> DatasetDict:
 def load_dolci_sft_data(cfg: DictConfig) -> DolciSFTData:
     prepared_dir = Path(cfg.data.prepared_dir)
     if prepared_dir.exists():
-        loaded = load_from_disk(str(prepared_dir))
-        if not isinstance(loaded, DatasetDict):
-            raise ValueError(f"Expected a DatasetDict at {prepared_dir}.")
-        dataset_dict = loaded
+        dataset_dict = load_dataset_dict(prepared_dir)
         _validate_split_sizes(dataset_dict, cfg)
     else:
         prepared_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -238,12 +257,7 @@ def build_tokenized_sft_data(cfg: DictConfig) -> Path:
         desc="Dropping rows that failed the template boundary check",
     )
 
-    staging = out.with_name(out.name + ".tmp")
-    shutil.rmtree(staging, ignore_errors=True)
-    staging.parent.mkdir(parents=True, exist_ok=True)
-    tokenized.save_to_disk(str(staging))
-    os.replace(staging, out)
-    return out
+    return save_dataset_dict_atomic(tokenized, out)
 
 
 def load_tokenized_sft_data(cfg: DictConfig) -> DatasetDict:
@@ -254,7 +268,4 @@ def load_tokenized_sft_data(cfg: DictConfig) -> DatasetDict:
             f"  uv run python scripts/run.py tokenize "
             f"data={cfg.data.name} method={cfg.method.model_name}"
         )
-    loaded = load_from_disk(str(out))
-    if not isinstance(loaded, DatasetDict):
-        raise ValueError(f"Expected a DatasetDict at {out}.")
-    return loaded
+    return load_dataset_dict(out)

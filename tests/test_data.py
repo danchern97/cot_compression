@@ -313,6 +313,45 @@ def test_tokenize_answer_masks_trace_and_scores_answer() -> None:
     assert tokenized.labels[rendered.index("Answer")] != IGNORE_INDEX
 
 
+def test_find_answer_span_skips_an_answer_quoted_inside_the_think_block() -> None:
+    """The CoT often quotes the final answer; the span must be the real one, at the end.
+
+    A forward search returned the copy inside the think block, so a full-trace render
+    scored reasoning tokens as the answer -- 35 of the 489 encoder eval rows. Covers
+    the verbatim path production takes, the template-normalized fallback, and an
+    earlier assistant turn that says the same thing.
+    """
+    verbatim = [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "<think>\nI will reply 42.\n</think>\n\n42."},
+    ]
+    rendered = (
+        "<|im_start|>user\nQuestion<|im_end|>\n<|im_start|>assistant\n"
+        + verbatim[1]["content"]
+        + "<|im_end|>\n"
+    )
+    start, end = find_answer_span(verbatim, rendered, "42.")
+    assert rendered[start:end] == "42." and start > rendered.index("</think>")
+
+    tokenizer = FakeChatTokenizer()
+    for messages in (
+        [
+            {"role": "user", "content": "Question"},
+            {"role": "assistant", "content": "<think>Say Same.</think>\nSame."},
+        ],
+        [
+            {"role": "user", "content": "Q1"},
+            {"role": "assistant", "content": "<think>t</think>\nSame."},
+            {"role": "user", "content": "Q2"},
+            {"role": "assistant", "content": "<think>Say Same.</think>\nSame."},
+        ],
+    ):
+        rendered = tokenizer.apply_chat_template(messages, tokenize=False)
+        start, end = find_answer_span(messages, rendered, "Same.")
+        assert rendered[start:end] == "Same."
+        assert start > rendered.rindex("</think>"), "the real answer, not a quote"
+
+
 def test_find_answer_span_handles_template_normalized_think_tags() -> None:
     messages = [
         {"role": "user", "content": "Question"},

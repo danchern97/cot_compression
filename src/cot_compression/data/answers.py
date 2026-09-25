@@ -107,20 +107,36 @@ def prefix_token_ids(trace: AnswerTrace, tokenizer: Any) -> list[int]:
 def find_answer_span(
     messages: list[Message], rendered: str, answer: str
 ) -> tuple[int, int]:
+    """Character span of `answer` in `rendered`: the end of the FINAL assistant turn.
+
+    `answer` is by construction the suffix of the last assistant message, and that
+    message's content also holds the think block -- which quotes the answer verbatim
+    often enough to matter: 35 of the 489 rows of the encoder eval slice. Every
+    search therefore runs BACKWARDS, inside the final assistant message when the
+    template renders it verbatim and over the whole render otherwise. The answer is a
+    suffix, so its occurrence is the right-most one.
+
+    A forward search returned the copy inside the CoT, so every render that keeps the
+    trace (`base`) scored reasoning tokens as the answer on those rows. Renders that
+    replace the trace (`no_cot`, placeholders) were unaffected: nothing precedes the
+    answer there that could contain it.
+    """
+    final = max(
+        (i for i, message in enumerate(messages) if message["role"] == "assistant"),
+        default=None,
+    )
     cursor = 0
-    for message in messages:
+    for index, message in enumerate(messages):
         content = message["content"]
         start = rendered.find(content, cursor)
         if start == -1:
             break
         end = start + len(content)
         cursor = end
-        if message["role"] != "assistant":
-            continue
-
-        answer_start = rendered.find(answer, start, end)
-        if answer_start != -1:
-            return answer_start, answer_start + len(answer)
+        if index == final:
+            answer_start = rendered.rfind(answer, start, end)
+            if answer_start != -1:
+                return answer_start, answer_start + len(answer)
 
     answer_start = rendered.rfind(answer)
     if answer_start != -1:

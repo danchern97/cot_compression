@@ -40,6 +40,49 @@ class LoopState:
     global_step: int = 0
     tokens_seen: int = 0
     best_eval_loss: float = float("inf")
+    # Total gradient norm of the step just taken, before clipping.
+    last_grad_norm: float = 0.0
+    # How to force DDP's first-iteration gradient allocation. None keeps the SFT
+    # behaviour below; a caller whose module does not take
+    # `(input_ids, attention_mask, labels)` positionally -- the encoder path --
+    # supplies its own, or a no-op when the transient is too small to matter.
+    prime_batch: Callable[[LoopState], None] | None = None
+    # Extra scalars merged into every `log_interval` emission. The encoder path
+    # reports codebook health here; without it a collapsed codebook and a healthy
+    # one produce identical loss curves.
+    extra_metrics: Callable[[LoopState], dict[str, float]] | None = None
+    # Extra scalars merged into every `eval/` emission, given the eval loss. The
+    # encoder path reports its distance to the `no_cot` floor and `base` ceiling
+    # here -- the pair that says whether a run is working at all.
+    eval_metrics: Callable[[LoopState, float], dict[str, float]] | None = None
+    # What `estimate_loss`'s return is logged as. The encoder's objective carries
+    # the quantizer and next-patch terms as well as answer CE, so calling it
+    # `eval/loss` next to the pure-CE `eval/base_row` invites comparing two
+    # different quantities; that path logs every component separately beside it.
+    eval_loss_key: str = "eval/loss"
+    # Which emitted metric `best/` is selected on. Empty keeps the historical
+    # behaviour of selecting on `estimate_loss`'s return, i.e. the full objective.
+    # A caller whose objective includes terms it is not judged on -- the encoder,
+    # once next-patch supervision dominates the total -- names the metric instead.
+    best_metric_key: str = ""
+    # Runs after each optimizer step, with the optimizer's state settled. The
+    # encoder path reseeds dead codebook entries here -- it needs the optimizer
+    # (to clear stale Adam moments) and the step count (to skip EMA warmup),
+    # neither of which the module can see.
+    post_step: Callable[[LoopState], None] | None = None
+    # What to divide this step's loss terms by, counted from the step's own
+    # micro-batches before any of them runs. None keeps the SFT behaviour: one
+    # scalar loss over `plan.denom[step]` supervised tokens.
+    #
+    # When set, the module returns a VECTOR of term sums and this returns a vector
+    # of the same length; each term is divided by its own global count (rows, rows
+    # with a supervised patch, ...) and the results summed. That is the only way to
+    # normalize two terms differently and still have the result be independent of
+    # how rows were grouped into micro-batches -- which is exactly what a per-row
+    # objective under gradient accumulation and DDP needs.
+    step_denominators: (
+        Callable[[list[dict[str, torch.Tensor]]], torch.Tensor] | None
+    ) = None
     _last_checkpoint_time: float = field(default_factory=time.monotonic)
 
     @property
@@ -215,13 +258,35 @@ def estimate_loss(
     state: LoopState,
     loader: DataLoader,
 ) -> float:
-    """Token-weighted mean cross-entropy over the fixed eval slice.
+    """The objective over the fixed eval slice.
 
-    Sum of losses over sum of tokens, all-reduced -- not a mean of per-batch
+    Sums of losses over sums of denominators, all-reduced -- not a mean of per-batch
     means, which is biased whenever batches hold different numbers of supervised
-    tokens (they always do here, since batches are token-budgeted).
+    tokens or rows (they always do here, since batches are token-budgeted).
+
+    With `step_denominators` set, each of the module's terms is divided by its own
+    total over the whole slice, so this is the same quantity the training objective
+    is; without it, the historical token-weighted cross-entropy.
     """
     state.module.eval()
+    if state.step_denominators is not None:
+        terms: torch.Tensor | None = None
+        counts: torch.Tensor | None = None
+        for batch in loader:
+            raw = cast(dict[str, torch.Tensor], batch)
+            batch_counts = state.step_denominators([raw])
+            with _autocast(state):
+                batch_terms = state.module(**move_batch(raw, state.device)).double()
+            terms = batch_terms if terms is None else terms + batch_terms
+            counts = batch_counts if counts is None else counts + batch_counts
+        state.module.train()
+        if terms is None or counts is None:
+            raise RuntimeError("Evaluation slice was empty.")
+        if state.world_size > 1:
+            dist.all_reduce(terms, op=dist.ReduceOp.SUM)
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        return float((terms / counts.clamp_min(1.0)).sum().item())
+
     totals = torch.zeros(2, dtype=torch.float64, device=state.device)
     for batch in loader:
         moved = move_batch(cast(dict[str, torch.Tensor], batch), state.device)
@@ -296,10 +361,39 @@ def run_training(
         denom = plan.denom[step]
         running = torch.zeros((), dtype=torch.float64, device=state.device)
 
+        # With per-term denominators the step's counts must be known before its
+        # first backward, so the whole step is pulled off the loader first. These
+        # are pinned CPU tensors straight from the workers -- a few MB -- and the
+        # one all-reduce per step is free beside a ~10 s step.
+        prefetched: list[dict[str, torch.Tensor]] = []
+        denoms: torch.Tensor | None = None
+        if state.step_denominators is not None:
+            prefetched = [
+                cast(dict[str, torch.Tensor], next(batches))
+                for _ in range(micro_per_rank)
+            ]
+            denoms = state.step_denominators(prefetched)
+            if state.world_size > 1:
+                dist.all_reduce(denoms, op=dist.ReduceOp.SUM)
+            # By convention the first denominator is the step's row count, which the
+            # plan already knows. They can only disagree if preparation dropped a
+            # row, and a silently smaller denominator would re-weight every other
+            # row in the step -- so this is an error, not a correction.
+            if plan.rows and int(denoms[0]) != plan.rows[step]:
+                raise RuntimeError(
+                    f"step {step} received {int(denoms[0])} rows but the plan says "
+                    f"{plan.rows[step]}: preparation dropped rows, so the per-row "
+                    "objective would be normalized by the wrong count."
+                )
+            denoms = denoms.clamp_min(1.0)
+
         for micro in range(micro_per_rank):
-            batch = move_batch(
-                cast(dict[str, torch.Tensor], next(batches)), state.device
+            raw = (
+                prefetched[micro]
+                if prefetched
+                else cast(dict[str, torch.Tensor], next(batches))
             )
+            batch = move_batch(raw, state.device)
             is_last = micro == micro_per_rank - 1
             sync = contextlib.nullcontext()
             if not is_last and state.world_size > 1:
@@ -308,9 +402,14 @@ def run_training(
                 with sync:
                     with _autocast(state):
                         loss_sum = state.module(**batch)
+                    normalized = (
+                        loss_sum / denom
+                        if denoms is None
+                        else (loss_sum / denoms).sum()
+                    )
                     # DDP all-reduces gradients as a mean over ranks, so scaling
-                    # by world_size recovers d(total_CE / total_label_tokens).
-                    (loss_sum * state.world_size / denom).backward()
+                    # by world_size recovers the gradient of the global objective.
+                    (normalized * state.world_size).backward()
             except torch.OutOfMemoryError as error:
                 # A bare OOM traceback says nothing about which shape caused it,
                 # and micro-batch shapes vary every step here. Without this you
@@ -321,7 +420,9 @@ def run_training(
                     f"({batch['input_ids'].numel()} padded tokens) | "
                     f"{_memory_report(state)}"
                 ) from error
-            running += loss_sum.detach().double()
+            # The NORMALIZED contribution, so `train/loss` is the objective itself
+            # whichever denominators are in play.
+            running += normalized.detach().double()
             if debug_memory and state.is_main:
                 rows, width = batch["input_ids"].shape
                 state.logger.info(
@@ -329,8 +430,17 @@ def run_training(
                     f"padded_tokens={rows * width} | {_memory_report(state)}"
                 )
 
-        torch.nn.utils.clip_grad_norm_(
-            state.module.parameters(), max_norm=float(cfg.training.gradient_clip)
+        # The return was previously discarded. It is the single most useful number
+        # for telling a gradient explosion from a forward-pass NaN, and both
+        # encoder arms died at step ~780/~990 with no way to distinguish them.
+        # Note clipping does NOT contain a NaN: clip_coef = max_norm/(NaN+1e-6) is
+        # NaN, so every gradient becomes NaN. An *Inf* norm instead gives
+        # clip_coef = 0 and zeroes the gradients. So a NaN here means a genuine
+        # 0/0, inf-inf or 0*inf upstream, not a magnitude overflow.
+        state.last_grad_norm = float(
+            torch.nn.utils.clip_grad_norm_(
+                state.module.parameters(), max_norm=float(cfg.training.gradient_clip)
+            )
         )
         state.optimizer.step()
         state.scheduler.step()
@@ -342,6 +452,8 @@ def run_training(
         # was expected. Zeroing in place keeps the views intact.
         state.optimizer.zero_grad(set_to_none=False)
         state.global_step = step + 1
+        if state.post_step is not None:
+            state.post_step(state)
         state.tokens_seen += denom
         window_tokens += denom
 
@@ -351,18 +463,20 @@ def run_training(
             elapsed = max(time.monotonic() - window_start, 1e-9)
             state.logger.log_metrics(
                 {
-                    "train/loss": float(running.item() / denom),
+                    "train/loss": float(running.item()),
                     "train/lr": state.scheduler.get_last_lr()[0],
                     # plan.denom is already summed over ranks, so these are global
                     # counts. Scaling by world_size here would report 4x the real
                     # throughput and make a 30% MFU run look like 120%.
                     "train/tokens_per_sec": window_tokens / elapsed,
                     "train/tokens_seen": float(state.tokens_seen),
+                    "train/grad_norm": state.last_grad_norm,
                     "train/gpu_mem_gb": (
                         torch.cuda.max_memory_allocated() / 2**30
                         if state.device.type == "cuda"
                         else 0.0
                     ),
+                    **(state.extra_metrics(state) if state.extra_metrics else {}),
                 },
                 step=state.global_step,
             )
@@ -391,9 +505,19 @@ def run_training(
 def _evaluate(state: LoopState, eval_loader: DataLoader) -> float:
     """Score the fixed slice; keep `best/` pointing at the lowest loss so far."""
     loss = estimate_loss(state, eval_loader)
-    state.logger.log_metrics({"eval/loss": loss}, step=state.global_step)
-    if loss < state.best_eval_loss:
-        state.best_eval_loss = loss
+    metrics = {state.eval_loss_key: loss}
+    if state.eval_metrics is not None:
+        metrics.update(state.eval_metrics(state, loss))
+    state.logger.log_metrics(metrics, step=state.global_step)
+    selected = (
+        metrics.get(state.best_metric_key, loss) if state.best_metric_key else loss
+    )
+    # Rank 0 decides, and every rank then runs the same branch. The metrics are
+    # all-reduced, so ranks SHOULD agree -- but the barrier below is a collective,
+    # and a float compare that differed on one rank would leave it alone in a
+    # barrier the others never enter.
+    if _decided_on_rank0(state, selected < state.best_eval_loss):
+        state.best_eval_loss = selected
         if state.is_main:
             save_checkpoint(state, full=False)
         _barrier(state)
@@ -421,6 +545,9 @@ def _prime_gradient_buckets(state: LoopState) -> None:
     is stepped, so training is unaffected.
     """
     if state.world_size <= 1:
+        return
+    if state.prime_batch is not None:
+        state.prime_batch(state)
         return
 
     ids = torch.full((1, 8), 1, dtype=torch.long, device=state.device)
@@ -457,11 +584,16 @@ def _due_for_checkpoint(state: LoopState) -> bool:
     error against a ~27 s step; a deadlock 40 hours into a 45,000 SBU run is not.
     """
     elapsed = (time.monotonic() - state._last_checkpoint_time) / 60.0
-    due = elapsed >= float(state.cfg.training.checkpoint_minutes)
-    if state.world_size <= 1:
-        return due
+    return _decided_on_rank0(
+        state, elapsed >= float(state.cfg.training.checkpoint_minutes)
+    )
 
-    flag = torch.tensor([int(due)], dtype=torch.uint8, device=state.device)
+
+def _decided_on_rank0(state: LoopState, local: bool) -> bool:
+    """Rank 0's value of `local`, broadcast, for any decision that gates a collective."""
+    if state.world_size <= 1:
+        return local
+    flag = torch.tensor([int(local)], dtype=torch.uint8, device=state.device)
     dist.broadcast(flag, src=0)
     return bool(flag.item())
 

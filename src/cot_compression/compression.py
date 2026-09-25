@@ -69,6 +69,15 @@ class CompressionMethod:
     def patching_name(self) -> str:
         return self.patching.name if self.patching is not None else "none"
 
+    def requires_prefix(self) -> bool:
+        """Whether ``materialize`` needs the prompt tokens preceding the CoT.
+
+        Declared rather than always supplied because `prefix_token_ids` renders a
+        chat template, which is not free at eval scale. Only the learned encoder
+        cross-attends to the prompt; every training-free method ignores it.
+        """
+        return False
+
     def weight_signal(self) -> str | None:
         """Which per-token signal the *pooling* consumes, or None.
 
@@ -126,6 +135,7 @@ class CompressionMethod:
         model: Any,
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
+        prefix_ids: list[int] | None = None,
     ) -> torch.Tensor | None:
         """Build the [num_slots, hidden] slot matrix, or None for text methods.
 
@@ -144,6 +154,7 @@ class CompressionMethod:
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
         cot_ids: list[int] | None = None,
+        prefix_ids: list[int] | None = None,
     ) -> CompressionResult:
         """Compress ``trace``'s CoT: ``plan`` then ``materialize``, in one call.
 
@@ -155,7 +166,14 @@ class CompressionMethod:
             cot_ids = cot_token_ids(trace, tokenizer)
         plan = self.plan(len(cot_ids), sample_index, seed, cot_signals, device)
         slot_embeddings = self.materialize(
-            cot_ids, sample_index, seed, tokenizer, model, device, cot_signals
+            cot_ids,
+            sample_index,
+            seed,
+            tokenizer,
+            model,
+            device,
+            cot_signals,
+            prefix_ids,
         )
         return CompressionResult(
             messages=compressed_messages(trace, plan.num_slots),
@@ -297,8 +315,10 @@ class BaseCompressionMethod(CompressionMethod):
         model: Any,
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
+        prefix_ids: list[int] | None = None,
     ) -> torch.Tensor | None:
         del cot_ids, sample_index, seed, tokenizer, model, device, cot_signals
+        del prefix_ids
         return None
 
 
@@ -339,8 +359,10 @@ class NoCotCompressionMethod(CompressionMethod):
         model: Any,
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
+        prefix_ids: list[int] | None = None,
     ) -> torch.Tensor | None:
         del cot_ids, sample_index, seed, tokenizer, model, device, cot_signals
+        del prefix_ids
         return None
 
 
@@ -376,8 +398,9 @@ class EmbeddingCompressionMethod(CompressionMethod):
         model: Any,
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
+        prefix_ids: list[int] | None = None,
     ) -> torch.Tensor | None:
-        del tokenizer
+        del tokenizer, prefix_ids
         values = _patching_values(self, cot_signals, device)
         spans = _split_spans(self, len(cot_ids), values, sample_index, seed)
         weight_signal = self.weight_signal()
@@ -451,6 +474,15 @@ class SignalWeightedMeanCompressionMethod(EmbeddingCompressionMethod):
         object.__setattr__(self, "temperature", float(temperature))
         object.__setattr__(self, "signal", signal)
 
+    def requires_prefix(self) -> bool:
+        """Whether ``materialize`` needs the prompt tokens preceding the CoT.
+
+        Declared rather than always supplied because `prefix_token_ids` renders a
+        chat template, which is not free at eval scale. Only the learned encoder
+        cross-attends to the prompt; every training-free method ignores it.
+        """
+        return False
+
     def weight_signal(self) -> str | None:
         return self.signal
 
@@ -489,6 +521,20 @@ def _regular_vocab_bound(tokenizer: Any, fallback: int) -> int:
     return min(added.values()) if added else fallback
 
 
+def random_slot_token_ids(
+    num_slots: int, sample_index: int, seed: int, vocab_bound: int
+) -> list[int]:
+    """One random regular-vocab token id per slot.
+
+    Shared with the encoder's `random` latent initialization so the two cannot
+    drift: the encoder's step-0 behaviour is then the *measured* `random`
+    baseline, not a lookalike. Keyed on `seed + sample_index` per the repo
+    convention, so sample i draws the same ids under every method.
+    """
+    rng = random.Random(seed + sample_index)
+    return [rng.randrange(vocab_bound) for _ in range(num_slots)]
+
+
 @dataclass(frozen=True)
 class RandomCompressionMethod(CompressionMethod):
     """Baseline: replace each patch with a random real-vocab token's embedding.
@@ -516,13 +562,14 @@ class RandomCompressionMethod(CompressionMethod):
         model: Any,
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
+        prefix_ids: list[int] | None = None,
     ) -> torch.Tensor | None:
+        del prefix_ids
         values = _patching_values(self, cot_signals, device)
         spans = _split_spans(self, len(cot_ids), values, sample_index, seed)
         weight = model.get_input_embeddings().weight
         high = _regular_vocab_bound(tokenizer, int(weight.shape[0]))
-        rng = random.Random(seed + sample_index)
-        ids = [rng.randrange(high) for _ in spans]
+        ids = random_slot_token_ids(len(spans), sample_index, seed, high)
         with torch.no_grad():
             return weight[ids].detach().clone()
 
@@ -597,6 +644,22 @@ def build_compression_methods(cfg: DictConfig) -> list[CompressionMethod]:
             method_cfg = cfg.evaluation.methods[name]
             patching = build_patching_method(method_cfg.get("patching"), patching_cfg)
             methods.append(_PATCHED_METHODS[name](patching=patching))
+        elif name == "learned":
+            # Both imports are deferred, and both have to be. `encoder.method`
+            # imports this module; and `training.utils` triggers
+            # `training/__init__`, which imports `evaluate`, which imports this
+            # module -- at module scope either one is a partially-initialized
+            # import error.
+            from cot_compression.encoder.method import build_learned_method
+            from cot_compression.training.utils import resolve_device
+
+            method_cfg = cfg.evaluation.methods[name]
+            patching = build_patching_method(method_cfg.get("patching"), patching_cfg)
+            methods.append(
+                build_learned_method(
+                    cfg, patching, resolve_device(str(cfg.evaluation.device))
+                )
+            )
         else:
             raise ValueError(f"Unknown evaluation method: {name}")
     return methods
