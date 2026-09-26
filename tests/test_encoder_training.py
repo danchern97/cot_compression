@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import numpy as np
@@ -224,8 +225,14 @@ def _signal_patching():
 
 
 def test_prep_dataset_refuses_unsupported_configurations(tokenizer):
-    """Averaging inits cannot be prepared worker-side; say so loudly."""
-    with pytest.raises(NotImplementedError, match="latent_init"):
+    """An unknown initializer must fail at construction, not per sample.
+
+    `simple_mean` used to be the example here, because a worker holds no embedding
+    table. It is now supported: the worker ships a bag partition and the main process
+    does one `embedding_bag`. So the refusal that remains is for names that mean
+    nothing at all.
+    """
+    with pytest.raises(ValueError, match="latent_init"):
         EncoderPrepDataset(
             _rows(2, seed=0),
             tokenizer,
@@ -233,8 +240,35 @@ def test_prep_dataset_refuses_unsupported_configurations(tokenizer):
             seed=1,
             max_length=None,
             vocab_bound=100,
-            latent_init="simple_mean",
+            latent_init="nonesuch",
         )
+
+
+def test_pooled_inits_ship_a_bag_partition_instead_of_token_ids(tokenizer):
+    """What replaced the refusal: a partition the main process can average."""
+    for init, per_slot in (("step_mean", False), ("simple_mean", True)):
+        prep = EncoderPrepDataset(
+            _rows(2, seed=0),
+            tokenizer,
+            UniformPatchingMethod(compression_ratio=4.0),
+            seed=1,
+            max_length=None,
+            vocab_bound=100,
+            latent_init=init,
+        )
+        sample = prep[0]
+        assert sample is not None
+        assert sample.init_ids == [], "pooled inits pick no single token"
+        # Bags tile the trace, so the flat list is the CoT itself -- which is what
+        # keeps this linear rather than quadratic in a step's latent count.
+        assert len(sample.init_bag_ids) == len(sample.context_ids) - (
+            sample.context_ids.index(sample.init_bag_ids[0])
+        )
+        assert sample.init_bag_offsets[0] == 0
+        assert sample.init_bag_offsets == sorted(set(sample.init_bag_offsets))
+        # One bag per latent for `simple_mean`; one per step for `step_mean`. Under
+        # uniform patching those coincide, since one span is one step.
+        assert len(sample.init_bag_offsets) == sample.num_slots or not per_slot
 
 
 def test_prep_dataset_demands_the_signal_cache_when_needed(tokenizer):
@@ -685,6 +719,8 @@ def test_baselines_score_every_control_on_the_same_answer_tokens(patched, tokeni
     class _DropsARow:
         def __init__(self, prep):
             self.prep, self.tokenizer = prep, prep.tokenizer
+            # The seed is built for the prep's initializer, so the stub must say which.
+            self.latent_init = prep.latent_init
 
         def __getitem__(self, index):
             return None if index == 1 else self.prep[index]
@@ -913,6 +949,12 @@ def test_dead_codes_metric_reports_the_count_before_reseeding(patched, tmp_path)
     module.last_dead_count = 0
     module.last_quant_rel_error = None
     module.last_code_counts = None
+    # This stub enumerates exactly what `codebook_metrics` reads, so a new metric
+    # must be added here too rather than made optional with getattr in production --
+    # a defensive read there would hide a genuinely missing attribute.
+    module.last_within_step_cos = None
+    module.last_across_step_cos = None
+    module.last_within_step_pairs = None
     module.pop_totals = lambda train: {}
 
     encoder.quantizer.usage[:] = 100.0
@@ -1105,7 +1147,7 @@ def test_width_helpers():
         _rows_batch(width=9)
 
 
-def _aux_training_module(width_multiple):
+def _aux_training_module(width_multiple, latent_init="random"):
     from cot_compression.encoder.frozen import FrozenBackbone
     from cot_compression.encoder.training import EncoderTrainingModule
 
@@ -1119,6 +1161,7 @@ def _aux_training_module(width_multiple):
             n_heads=4,
             ffn_mult=2,
             codebook_size=8,
+            latent_init=latent_init,
         )
     )
     return EncoderTrainingModule(
@@ -1467,16 +1510,20 @@ def test_new_data_at_a_seen_shape_does_not_recompile():
 # --------------------------------------------------------------------------- #
 
 
-def _prepared_batch(tokenizer, rows, indices):
+def _prepared_batch(tokenizer, rows, indices, step=False):
     """Collate real prepared rows, exactly as the training loader does."""
+    from cot_compression.patching import ParagraphStepPatchingMethod
+
     prep = EncoderPrepDataset(
         rows,
         tokenizer,
-        UniformPatchingMethod(compression_ratio=4.0),
+        ParagraphStepPatchingMethod(compression_ratio=4.0)
+        if step
+        else UniformPatchingMethod(compression_ratio=4.0),
         seed=7,
         max_length=None,
         vocab_bound=1000,
-        latent_init="random",
+        latent_init="step_mean" if step else "random",
     )
     samples = []
     for index in indices:
@@ -1486,7 +1533,8 @@ def _prepared_batch(tokenizer, rows, indices):
     return collate_encoder_batch(samples, pad_token_id=int(tokenizer.pad_token_id))
 
 
-def test_objective_is_invariant_to_micro_batch_grouping(tokenizer):
+@pytest.mark.parametrize("step", [False, True])
+def test_objective_is_invariant_to_micro_batch_grouping(tokenizer, step):
     """THE property per-row normalization exists for.
 
     The same four rows must give the same objective and the same gradient whether
@@ -1495,14 +1543,27 @@ def test_objective_is_invariant_to_micro_batch_grouping(tokenizer):
     would fail here, and would silently weight rows by how the batcher happened to
     group them -- which changes with world_size, the token budget and the length
     distribution.
+
+    Run over BOTH arms. On the step arm it is also the strongest check on
+    `cond_slot` padding: two groupings pad it to different widths, so an
+    out-of-range or mis-indexed pad shows up as a changed objective here rather
+    than as a plausible number in a run.
     """
     from cot_compression.encoder.training import step_denominators
 
     torch.manual_seed(0)
-    module = _aux_training_module(None)
-    rows = _rows(4, seed=5)
-    whole = _prepared_batch(tokenizer, rows, [0, 1, 2, 3])
-    halves = [_prepared_batch(tokenizer, rows, pair) for pair in ([0, 1], [2, 3])]
+    module = _aux_training_module(None, "step_mean" if step else "random")
+    rows = _step_rows(4, seed=5) if step else _rows(4, seed=5)
+    whole = _prepared_batch(tokenizer, rows, [0, 1, 2, 3], step=step)
+    halves = [
+        _prepared_batch(tokenizer, rows, pair, step=step) for pair in ([0, 1], [2, 3])
+    ]
+    if step:
+        # The groupings must genuinely disagree on the padded widths, or this is
+        # not testing what it claims.
+        assert whole["cond_slot"].shape[1] != min(
+            h["cond_slot"].shape[1] for h in halves
+        ) or whole["slot_mask"].shape[1] != min(h["slot_mask"].shape[1] for h in halves)
 
     denominators = step_denominators(torch.device("cpu"), [whole])
     assert denominators.tolist() == [4.0, 4.0], "4 rows, all with supervised patches"
@@ -1573,3 +1634,665 @@ def test_kmeans_pool_accumulates_across_micro_batches(tokenizer):
     # The codebook is seeded from those outputs, not left at its placeholder.
     codebook = module.encoder.quantizer.codebook.detach()
     assert torch.isfinite(codebook).all() and float(codebook.abs().sum()) > 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Paragraph-step segmentation
+# --------------------------------------------------------------------------- #
+
+# A step fixture whose conditioning slot is NOT `m - 1` anywhere it matters -- the
+# whole difference between next-patch and next-step supervision. Five slots a row:
+#   row 0  steps {0,1,2} {3,4}        cond_slot [_, 2]      (m-1 would say 0)
+#   row 1  steps {0} {1,2} {3,4}      cond_slot [_, 0, 2]   (m-1 would say 1)
+#   row 2  same, but step 1 subsampled away: step 2 must STILL condition on the last
+#          latent of step 1, which is the case the run-keyed weighting can get wrong
+#   row 3  a single-step row with nothing supervised -- 1.9% of real traces
+_STEP_SLOT_POSITIONS = [
+    [2, 3, 4, 5, 6],
+    [1, 2, 3, 4, 5],
+    [3, 4, 5, 6, 7],
+    [1, 2, 3, 4, 5],
+]
+_STEP_PREFIX_LEN = [7, 6, 8, 6]
+_STEP_COND_SLOT = [[0, 2, 0], [0, 0, 2], [0, 0, 2], [0, 0, 0]]
+_STEP_AUX_PATCH = [
+    [1, 1, -1, -1, -1],
+    [1, 1, 2, -1, -1],
+    [2, 2, 2, -1, -1],
+    [-1, -1, -1, -1, -1],
+]
+_STEP_AUX_IDS = [
+    [12, 13, -100, -100, -100],
+    [21, 22, 23, -100, -100],
+    [31, 32, 33, -100, -100],
+    [-100] * 5,
+]
+
+
+def _step_rows(count: int, seed: int) -> Dataset:
+    """Rollouts whose think block has real `\\n\\n` paragraphs.
+
+    `_rows` has none, so under paragraph patching every one of its rows is a single
+    step and the next-step loss would silently supervise nothing -- the tests would
+    pass while measuring an empty objective. Kept separate so the existing arm's
+    assertions stay byte-stable.
+    """
+    rng = np.random.default_rng(seed)
+    records = []
+    for index in range(count):
+        paragraphs = [
+            " ".join(f"step{int(v)}" for v in rng.integers(0, 50, size=int(size)))
+            for size in rng.integers(4, 14, size=5)
+        ]
+        cot = "\n\n".join(paragraphs)
+        records.append(
+            {
+                "messages": [
+                    {"role": "user", "content": f"Question {index}? Reason it out."},
+                    {
+                        "role": "assistant",
+                        "content": f"<think>\n{cot}\n</think>\n\nThe answer is {index}.",
+                    },
+                ],
+                "domain": "math",
+                "rollout_id": f"p{index:04d}:r0",
+            }
+        )
+    return Dataset.from_list(records)
+
+
+def _step_prep(rows, tokenizer, **overrides):
+    from cot_compression.patching import ParagraphStepPatchingMethod
+
+    kwargs = dict(
+        seed=1337,
+        max_length=None,
+        vocab_bound=1000,
+        latent_init="step_mean",
+    )
+    kwargs.update(overrides)
+    return EncoderPrepDataset(
+        rows, tokenizer, ParagraphStepPatchingMethod(compression_ratio=4.0), **kwargs
+    )
+
+
+def test_prep_emits_consistent_step_geometry(tokenizer):
+    """Every invariant the device code indexes with, checked on a real tokenization."""
+    rows = _step_rows(4, seed=5)
+    prep = _step_prep(rows, tokenizer)
+    for index in range(len(rows)):
+        sample = prep[index]
+        assert sample is not None
+        assert len(sample.cross_limit) == sample.num_slots
+        assert len(sample.step_of_latent) == sample.num_slots
+        assert sample.query_limit is None, "the default anchor ships no query_limit"
+
+        # cross_limit is constant WITHIN a step and strictly increases between them:
+        # that is what "each latent sees its whole step, and nothing after it" means.
+        by_step: dict[int, set[int]] = {}
+        for step, limit in zip(sample.step_of_latent, sample.cross_limit, strict=True):
+            by_step.setdefault(step, set()).add(limit)
+        assert all(len(v) == 1 for v in by_step.values())
+        limits = [next(iter(by_step[s])) for s in sorted(by_step)]
+        assert limits == sorted(set(limits))
+
+        # step_of_latent is non-decreasing, and cond_slot[m] is the last slot of m-1.
+        assert sample.step_of_latent == sorted(sample.step_of_latent)
+        num_steps = len(by_step)
+        assert len(sample.cond_slot) == num_steps
+        for step in range(1, num_steps):
+            previous = [
+                slot
+                for slot, owner in enumerate(sample.step_of_latent)
+                if owner == step - 1
+            ]
+            assert sample.cond_slot[step] == previous[-1]
+
+        # Multi-step, or the fixture is not testing what it claims.
+        assert num_steps > 1
+        assert min(sample.aux_patch) >= 1, "step 0 is never a target"
+        assert sample.aux_patch == sorted(sample.aux_patch)
+
+
+def test_substep_anchor_is_distinct_and_within_the_step(tokenizer):
+    rows = _step_rows(3, seed=6)
+    sample = _step_prep(rows, tokenizer, query_anchor="substep")[0]
+    assert sample is not None and sample.query_limit is not None
+    assert len(sample.query_limit) == sample.num_slots
+    # Strictly increasing overall, and never past what the latent may attend to --
+    # the `query_limit <= cross_limit` guarantee, checked on the CPU so the device
+    # never needs a syncing assert.
+    assert all(
+        a < b for a, b in zip(sample.query_limit, sample.query_limit[1:], strict=False)
+    )
+    assert all(
+        q <= c for q, c in zip(sample.query_limit, sample.cross_limit, strict=True)
+    )
+    # A step's LAST latent anchors exactly at the step end.
+    for step in set(sample.step_of_latent):
+        slots = [i for i, s in enumerate(sample.step_of_latent) if s == step]
+        assert sample.query_limit[slots[-1]] == sample.cross_limit[slots[-1]]
+
+
+def test_uniform_patching_geometry_is_unchanged(tokenizer):
+    """The degeneracy guarantee: token patching must produce its historical tensors.
+
+    One step per span means `cross_limit` is `prompt_len + span_end` and `cond_slot`
+    is `m - 1`, so the pre-step arm computes exactly what it did before -- which is
+    what lets the existing suite serve as this change's regression test.
+    """
+    rows = _rows(3, seed=7)
+    prep = EncoderPrepDataset(
+        rows,
+        tokenizer,
+        UniformPatchingMethod(compression_ratio=4.0),
+        seed=1337,
+        max_length=None,
+        vocab_bound=1000,
+        latent_init="random",
+    )
+    for index in range(len(rows)):
+        sample = prep[index]
+        assert sample is not None
+        assert sample.query_limit is None
+        assert sample.step_of_latent == list(range(sample.num_slots))
+        # One latent per step, so the conditioning slot for unit m is m-1 -- exactly
+        # the `(aux_patch - 1)` gather this path used before `cond_slot` existed.
+        # Entry 0 is a placeholder; unit 0 is never a target.
+        assert sample.cond_slot == [0, *range(sample.num_slots - 1)]
+        # One slot per step, so cross_limit is strictly increasing by the patch size.
+        assert sample.cross_limit == sorted(set(sample.cross_limit))
+        assert len(sample.cross_limit) == sample.num_slots
+
+
+def test_collate_pads_the_step_fields(tokenizer):
+    rows = _step_rows(3, seed=8)
+    prep = _step_prep(rows, tokenizer)
+    samples = [prep[i] for i in range(3)]
+    batch = collate_encoder_batch([s for s in samples if s is not None], pad_token_id=0)
+    slots = int(batch["slot_mask"].shape[1])
+    assert batch["cond_slot"].shape[0] == batch["step_of_latent"].shape[0]
+    assert batch["step_of_latent"].shape[1] == slots
+    assert "query_limit" not in batch, "omitted, not None: run_training .to()s values"
+    # Every padded gather index must still be in range -- the gather runs before the
+    # mask, so an out-of-range pad is a crash, not a masked-out value.
+    assert int(batch["cond_slot"].max()) < slots
+    assert int(batch["cond_slot"].min()) >= 0
+    # The pooled initializer's bags.
+    assert int(batch["init_bag_of_slot"].max()) < int(batch["init_bag_offsets"].numel())
+    assert batch["init_bag_offsets"][0] == 0
+
+
+def test_cond_slot_defaults_to_the_previous_slot():
+    """`cond_slot=None` must reproduce the pre-step gather exactly."""
+    from cot_compression.encoder.next_patch import build_next_patch_batch
+
+    common = dict(
+        slot_positions=torch.tensor(_ROWS_SLOT_POSITIONS),
+        aux_ids=torch.tensor(_ROWS_AUX_IDS),
+        aux_patch=torch.tensor(_ROWS_AUX_PATCH),
+        prefix_len=torch.tensor(_ROWS_PREFIX_LEN),
+    )
+    default = build_next_patch_batch(**common)
+    units = max(max(row) for row in _ROWS_AUX_PATCH) + 1
+    explicit = build_next_patch_batch(
+        **common,
+        cond_slot=torch.tensor([list(range(-1, units - 1))] * 4).clamp_min(0),
+    )
+    assert torch.equal(default.code_limit, explicit.code_limit)
+    assert torch.equal(default.predictor, explicit.predictor)
+
+
+@pytest.mark.parametrize("width_multiple", [None, 7])
+def test_next_step_loss_matches_the_naive_per_step_loop(width_multiple):
+    """THE correctness test for step supervision, against the specification run literally.
+
+    Same oracle as the per-patch case, with one thing changed: a step is conditioned
+    on the LAST latent of the step before it, not on slot `m - 1`. The fixture makes
+    those differ in every supervised row, includes a row whose step 1 was subsampled
+    away (step 2 must still reach back to step 1's last latent) and a single-step row
+    with nothing supervised at all.
+    """
+    from cot_compression.encoder.probe import naive_next_patch_loss
+
+    torch.manual_seed(0)
+    module = _aux_training_module(width_multiple)
+    spliced = (torch.randn(4, 9, module.backbone.hidden_size) * 0.03).requires_grad_()
+    aux_ids = torch.tensor(_STEP_AUX_IDS)
+    aux_patch = torch.tensor(_STEP_AUX_PATCH)
+    slot_positions = torch.tensor(_STEP_SLOT_POSITIONS)
+    cond_slot = torch.tensor(_STEP_COND_SLOT)
+
+    # The fixture must actually exercise the difference, or this test is vacuous.
+    assert any(
+        cond_slot[r, m] != m - 1
+        for r in range(4)
+        for m in set(_STEP_AUX_PATCH[r]) - {-1}
+    )
+
+    expected_pair = naive_next_patch_loss(
+        module.backbone, spliced, aux_ids, aux_patch, slot_positions, cond_slot
+    )
+    actual_pair, count, rows_with_steps = module._next_patch_loss(
+        spliced,
+        aux_ids,
+        aux_patch,
+        torch.tensor(_STEP_PREFIX_LEN),
+        slot_positions,
+        cond_slot,
+    )
+    expected, actual = expected_pair[0], actual_pair[0]
+    (got,) = torch.autograd.grad(actual, spliced, retain_graph=True)
+    (want,) = torch.autograd.grad(expected, spliced, retain_graph=True)
+    loss_error, grad_error = _relative_errors((actual, got), (expected, want))
+
+    token_error = float(
+        (actual_pair[1] - expected_pair[1]).abs() / expected_pair[1].abs()
+    )
+    assert token_error < 1e-6, token_error
+    rows_with_any = int((aux_patch >= 0).any(dim=1).sum())
+    assert int(rows_with_steps) == rows_with_any < aux_patch.shape[0]
+    assert count == int((aux_patch >= 0).sum())
+    # Same calibrated tolerances as the per-patch oracle: the two paths differ only
+    # in which slot they gather, so the floating-point noise floor is unchanged.
+    assert loss_error < 1e-6, loss_error
+    assert grad_error < 1e-3, grad_error
+
+
+def test_next_step_weights_average_within_step_then_over_steps():
+    """Spec item 6, asserted on the weights themselves rather than through a model."""
+    from cot_compression.encoder.next_patch import patch_weights
+
+    aux_patch = torch.tensor(_STEP_AUX_PATCH)
+    weights, steps_per_row = patch_weights(aux_patch)
+    assert steps_per_row.tolist() == [1, 2, 1, 0]
+
+    # Row 1 has two steps: one of 2 tokens and one of 1, so 1/(2*2), 1/(2*2), 1/(1*2).
+    offsets = torch.tensor([0, 2, 5, 8])
+    row1 = weights[int(offsets[1]) : int(offsets[2])]
+    assert torch.allclose(row1, torch.tensor([0.25, 0.25, 0.5]))
+    # And every supervised row's weights sum to exactly 1.
+    for start, end in ((0, 2), (2, 5), (5, 8)):
+        assert abs(float(weights[start:end].sum()) - 1.0) < 1e-6
+
+
+def test_step_mean_init_averages_the_step_embeddings(tokenizer):
+    """The pooled initializer, against a literal per-step mean of input embeddings.
+
+    Pooling per STEP and indexing is the whole trick: a step's latents share one
+    vector, so the flat bag list stays the CoT length instead of the sum of each
+    step's length times its latent count.
+    """
+    from cot_compression.encoder.frozen import FrozenBackbone
+    from cot_compression.encoder.training import EncoderTrainingModule
+
+    rows = _step_rows(2, seed=11)
+    samples = [s for s in (_step_prep(rows, tokenizer)[i] for i in range(2)) if s]
+    batch = collate_encoder_batch(samples, pad_token_id=0)
+
+    decoder = _tiny_decoder().float()
+    backbone = FrozenBackbone(decoder, ce_chunk_tokens=64, gradient_checkpointing=False)
+    encoder = CoTEncoder(
+        EncoderConfig(
+            d_llm=decoder.config.hidden_size,
+            n_blocks=1,
+            n_heads=4,
+            latent_init="step_mean",
+        )
+    )
+    module = EncoderTrainingModule(encoder, backbone, commit_weight=0.25)
+    latent = module._latent_init(
+        batch["init_ids"],
+        batch["init_bag_ids"],
+        batch["init_bag_offsets"],
+        batch["init_bag_of_slot"],
+    )
+
+    table = backbone.embedding_weight
+    for row, sample in enumerate(samples):
+        bounds = [*sample.init_bag_offsets, len(sample.init_bag_ids)]
+        for slot, step in enumerate(sample.step_of_latent):
+            ids = sample.init_bag_ids[bounds[step] : bounds[step + 1]]
+            want = table[torch.tensor(ids)].float().mean(0)
+            assert torch.allclose(latent[row, slot].float(), want, atol=1e-5)
+        # Every latent of a step gets the SAME vector -- which is exactly why the
+        # within-step cosine diagnostic exists.
+        for step in set(sample.step_of_latent):
+            slots = [i for i, s in enumerate(sample.step_of_latent) if s == step]
+            for slot in slots[1:]:
+                assert torch.equal(latent[row, slots[0]], latent[row, slot])
+
+
+def test_within_step_cosine_reports_collapse_and_diversity():
+    """The metric the whole symmetry question is decided on -- so it must not lie."""
+    from cot_compression.encoder.frozen import FrozenBackbone
+    from cot_compression.encoder.training import EncoderTrainingModule
+
+    decoder = _tiny_decoder().float()
+    backbone = FrozenBackbone(decoder, ce_chunk_tokens=64, gradient_checkpointing=False)
+    module = EncoderTrainingModule(
+        CoTEncoder(EncoderConfig(d_llm=4, n_blocks=1, n_heads=2)),
+        backbone,
+        commit_weight=0.25,
+    )
+    slot_mask = torch.ones(1, 4, dtype=torch.bool)
+    step_of_latent = torch.tensor([[0, 0, 1, 1]])
+
+    # Duplicated inside each step, orthogonal across them.
+    collapsed = torch.tensor(
+        [[[1.0, 0, 0, 0], [1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 1.0, 0, 0]]]
+    )
+    module._measure_step_cosines(collapsed, slot_mask, step_of_latent)
+    assert abs(float(module.last_within_step_cos) - 1.0) < 1e-5
+    assert abs(float(module.last_across_step_cos)) < 1e-5
+
+    # Orthogonal inside each step instead.
+    diverse = torch.eye(4).unsqueeze(0)
+    module._measure_step_cosines(diverse, slot_mask, step_of_latent)
+    assert abs(float(module.last_within_step_cos)) < 1e-5
+
+    # Absent rather than zero when nothing said which step a latent belongs to.
+    fresh = EncoderTrainingModule(
+        CoTEncoder(EncoderConfig(d_llm=4, n_blocks=1, n_heads=2)),
+        backbone,
+        commit_weight=0.25,
+    )
+    fresh._measure_step_cosines(diverse, slot_mask, None)
+    assert fresh.last_within_step_cos is None
+
+
+def test_training_runs_end_to_end_with_steps_and_no_quantizer(monkeypatch, tmp_path):
+    """The step arm through `train_encoder`: paragraphs, pooled init, no codebook."""
+    monkeypatch.delenv("SLURM_PROCID", raising=False)
+    monkeypatch.setattr(
+        "cot_compression.encoder.training.AutoModelForCausalLM",
+        type("M", (), {"from_pretrained": staticmethod(_tiny_decoder)}),
+    )
+    tok = AutoTokenizer.from_pretrained(TINY)
+    data = DatasetDict(
+        {
+            "train": _measured(_step_rows(12, seed=0), tok),
+            "val": _measured(_step_rows(4, seed=1), tok),
+        }
+    )
+    monkeypatch.setattr(
+        "cot_compression.encoder.training.load_trace_lengths", lambda cfg: data
+    )
+
+    cfg = _cfg(tmp_path, max_steps=2, log_interval=1)
+    cfg.encoder.patching = "paragraph"
+    cfg.encoder.use_vq = False
+    cfg.encoder.latent_init = "step_mean"
+    cfg.encoder.query_anchor = "step"
+    cfg.encoder.next_patch_weight = 1.0
+    # `step_mean` as a control is the encoder's own starting point, scored with no
+    # encoder -- which exercises the pooled path through `eval_baselines` too.
+    cfg.encoder.eval_controls = ["random", "step_mean"]
+    train_encoder(cfg)
+
+    root = tmp_path / "enc" / "checkpoints"
+    pointer = (root / "LATEST").read_text().strip()
+    assert (root / pointer / ENCODER_WEIGHTS).exists()
+    manifest = json.loads(
+        (root / pointer / "encoder_config.json").read_text(encoding="utf-8")
+    )
+    assert manifest["use_vq"] is False and manifest["query_anchor"] == "step"
+    # No codebook was built, so none was saved -- the DDP and checkpoint-hygiene
+    # reason `use_vq=False` must not construct the quantizer at all.
+    weights = torch.load(root / pointer / ENCODER_WEIGHTS, map_location="cpu")
+    assert not [k for k in weights if k.startswith("quantizer")]
+
+
+def test_architecture_guard_names_use_vq(tmp_path):
+    """A VQ checkpoint and a continuous one are different encoders, and must say so."""
+    from cot_compression.encoder.training import check_encoder_architecture
+
+    directory = tmp_path / "ckpt"
+    directory.mkdir()
+    quantized = EncoderConfig(d_llm=16, codebook_size=8, use_vq=True)
+    (directory / "encoder_config.json").write_text(
+        json.dumps(asdict(quantized)), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="use_vq"):
+        check_encoder_architecture(
+            EncoderConfig(d_llm=16, codebook_size=8, use_vq=False), directory
+        )
+
+    # But two continuous encoders differing only in a codebook size neither has are
+    # the same encoder -- refusing there would be a false alarm on a dead field.
+    continuous = EncoderConfig(d_llm=16, codebook_size=8, use_vq=False)
+    (directory / "encoder_config.json").write_text(
+        json.dumps(asdict(continuous)), encoding="utf-8"
+    )
+    check_encoder_architecture(
+        EncoderConfig(d_llm=16, codebook_size=64, use_vq=False), directory
+    )
+    # And query_anchor is compared, since it moves every cross-attention query.
+    with pytest.raises(ValueError, match="query_anchor"):
+        check_encoder_architecture(
+            EncoderConfig(
+                d_llm=16, codebook_size=8, use_vq=False, query_anchor="substep"
+            ),
+            directory,
+        )
+
+
+def test_a_trace_without_paragraph_breaks_has_no_supervised_step(tokenizer):
+    """The 1.9% of real traces with no `\\n\\n`, which subsampling used to be needed for.
+
+    They become one step, step 0 is never a target, so they carry no next-step loss
+    at all. Excluding them from the aux denominator rather than counting them as zero
+    is what keeps the term a mean over rows that actually have one -- and it is now
+    reachable with `next_patch_subsample=1.0`, which `step_denominators`' comment
+    used to deny.
+    """
+    from cot_compression.encoder.training import step_denominators
+
+    flat = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "Q?"},
+                    {
+                        "role": "assistant",
+                        "content": "<think>\nall one paragraph here</think>\n\nAns 1.",
+                    },
+                ],
+                "domain": "math",
+                "rollout_id": "p0:r0",
+            }
+        ]
+    )
+    sample = _step_prep(flat, tokenizer)[0]
+    assert sample is not None
+    assert len(sample.cond_slot) == 1, "one step"
+    assert sample.aux_patch == [], "step 0 is never a target"
+
+    others = _step_prep(_step_rows(2, seed=9), tokenizer)
+    mixed = [sample, *(s for s in (others[i] for i in range(2)) if s)]
+    batch = collate_encoder_batch(mixed, pad_token_id=int(tokenizer.pad_token_id))
+    counts = step_denominators(torch.device("cpu"), [batch])
+    assert counts.tolist() == [3.0, 2.0], "3 rows, 2 with a supervised step"
+
+
+# --------------------------------------------------------------------------- #
+# Train/eval agreement for the pooled seeds, and the learned method on steps
+# --------------------------------------------------------------------------- #
+
+
+def _seed_from_prep(prep, tokenizer, index, decoder):
+    """The training seed for one prepared row, via `latent_seed`."""
+    from cot_compression.encoder.training import latent_seed
+
+    sample = prep[index]
+    assert sample is not None
+    batch = collate_encoder_batch([sample], pad_token_id=int(tokenizer.pad_token_id))
+    return latent_seed(
+        decoder.get_input_embeddings().weight,
+        prep.latent_init,
+        batch["init_ids"],
+        batch.get("init_bag_ids"),
+        batch.get("init_bag_offsets"),
+        batch.get("init_bag_of_slot"),
+    )[0]
+
+
+@pytest.mark.parametrize("init", ["simple_mean", "step_mean"])
+def test_pooled_seed_matches_its_eval_twin(tokenizer, init):
+    """Training and `build_latent_init` must build the SAME seed, formula for formula.
+
+    They are two code paths -- a batched `embedding_bag` in training, the eval
+    harness's `CompressionMethod.materialize` at scoring time -- and nothing else
+    ties them together. They once disagreed: training averaged (`sum / c`) while
+    `simple_mean` in the harness is `sum / sqrt(c)`, so a checkpoint would have been
+    scored from a seed it never trained from.
+    """
+    from cot_compression.data.answers import (
+        cot_token_ids_and_offsets,
+        extract_answer_trace,
+    )
+    from cot_compression.encoder.frozen import build_latent_init
+    from cot_compression.patching import ParagraphStepPatchingMethod, SplitContext
+
+    decoder = _tiny_decoder().float()
+    rows = _step_rows(2, seed=21)
+    patching = ParagraphStepPatchingMethod(compression_ratio=4.0)
+    prep = EncoderPrepDataset(
+        rows,
+        tokenizer,
+        patching,
+        seed=7,
+        max_length=None,
+        vocab_bound=1000,
+        latent_init=init,
+    )
+    trained = _seed_from_prep(prep, tokenizer, 0, decoder)
+
+    trace = extract_answer_trace(rows[0]["messages"])
+    assert trace is not None
+    cot_ids, offsets = cot_token_ids_and_offsets(trace, tokenizer)
+    scored = build_latent_init(init, patching).materialize(
+        cot_ids,
+        0,
+        7,
+        tokenizer,
+        decoder,
+        torch.device("cpu"),
+        None,
+        context=SplitContext(text=trace.trace, offsets=offsets),
+    )
+    assert scored is not None
+    assert scored.shape == trained.shape
+    assert torch.allclose(scored, trained, atol=1e-6), float(
+        (scored - trained).abs().max()
+    )
+
+
+def test_latent_seed_refuses_a_batch_that_disagrees_with_the_init():
+    from cot_compression.encoder.training import latent_seed
+
+    weight = torch.randn(10, 4)
+    ids = torch.zeros(1, 2, dtype=torch.long)
+    with pytest.raises(RuntimeError, match="no bags"):
+        latent_seed(weight, "step_mean", ids, None, None, None)
+    bags = (torch.tensor([1, 2, 3]), torch.tensor([0]), torch.tensor([[0, 0]]))
+    with pytest.raises(RuntimeError, match="one token per slot"):
+        latent_seed(weight, "random", ids, *bags)
+
+
+def test_learned_method_on_steps_needs_the_layout_and_agrees_on_k(tokenizer):
+    """Caveat K1: the eval path must not score a step checkpoint from the wrong K.
+
+    Without the worker's layout, `materialize` must RAISE -- a RuntimeError, since
+    the eval loop reads a ValueError as a data skip and would silently score
+    nothing. With it, `plan` and `materialize` agree on K by construction.
+    """
+    from cot_compression.data.answers import (
+        cot_token_ids_and_offsets,
+        extract_answer_trace,
+        prefix_token_ids,
+    )
+    from cot_compression.encoder.frozen import build_latent_init
+    from cot_compression.encoder.method import LearnedCompressionMethod
+    from cot_compression.patching import ParagraphStepPatchingMethod, SplitContext
+
+    decoder = _tiny_decoder().eval()
+    encoder = CoTEncoder(
+        EncoderConfig(
+            d_llm=decoder.config.hidden_size,
+            n_blocks=1,
+            n_heads=4,
+            use_vq=False,
+            latent_init="step_mean",
+            position_encoding="rope",
+        )
+    ).eval()
+    patching = ParagraphStepPatchingMethod(compression_ratio=4.0)
+    method = LearnedCompressionMethod(
+        encoder=encoder,
+        patching=patching,
+        latent_init=build_latent_init("step_mean", patching),
+    )
+    # A new join key: no codebook to name, and the patching carries the rest.
+    assert method.name == "learned_enc_L1cont_rope_paragraph_cr4"
+
+    trace = extract_answer_trace(_step_rows(1, seed=23)[0]["messages"])
+    assert trace is not None
+    cot_ids, offsets = cot_token_ids_and_offsets(trace, tokenizer)
+    prefix = prefix_token_ids(trace, tokenizer)
+    device = torch.device("cpu")
+    with pytest.raises(RuntimeError, match="SplitContext"):
+        method.materialize(cot_ids, 0, 7, tokenizer, decoder, device, None, prefix)
+
+    # Exactly what the eval worker ships: the resolved layout, not the text.
+    layout = patching.layout(
+        len(cot_ids),
+        0,
+        7,
+        None,
+        context=SplitContext(text=trace.trace, offsets=offsets),
+    )
+    shipped = SplitContext(layout=layout)
+    plan = method.plan(len(cot_ids), 0, 7, None, device, shipped)
+    slots = method.materialize(
+        cot_ids, 0, 7, tokenizer, decoder, device, None, prefix, shipped
+    )
+    assert slots is not None
+    assert layout.num_steps > 1, "multi-step, or this is not testing steps"
+    assert slots.shape == (plan.num_slots, decoder.config.hidden_size)
+    assert plan.num_slots == layout.num_latents
+    assert torch.isfinite(slots).all()
+
+
+def test_within_step_metric_is_absent_under_token_patching():
+    """One latent per step leaves no within-step pair: undefined, not 0.0.
+
+    A 0.0 would read as "perfectly diverse" on the existing token-patching arm's
+    dashboard, so the metric must be omitted there rather than reported.
+    """
+    from cot_compression.encoder.frozen import FrozenBackbone
+    from cot_compression.encoder.training import EncoderTrainingModule, codebook_metrics
+
+    backbone = FrozenBackbone(
+        _tiny_decoder().float(), ce_chunk_tokens=64, gradient_checkpointing=False
+    )
+    module = EncoderTrainingModule(
+        CoTEncoder(EncoderConfig(d_llm=4, n_blocks=1, n_heads=2, use_vq=False)),
+        backbone,
+        commit_weight=0.25,
+    )
+    module.pop_totals = lambda train: {}  # type: ignore[method-assign]
+    slot_mask = torch.ones(1, 4, dtype=torch.bool)
+    state = SimpleNamespace(module=module)
+
+    module._measure_step_cosines(torch.randn(1, 4, 4), slot_mask, torch.arange(4)[None])
+    assert float(module.last_within_step_pairs) == 0.0
+    assert "enc/within_step_cos" not in codebook_metrics(state)
+
+    module._measure_step_cosines(
+        torch.randn(1, 4, 4), slot_mask, torch.tensor([[0, 0, 1, 1]])
+    )
+    report = codebook_metrics(state)
+    assert "enc/within_step_cos" in report and "enc/across_step_cos" in report
+    # And a continuous encoder reports no codebook metrics at all.
+    assert not [key for key in report if key.startswith("vq/")]

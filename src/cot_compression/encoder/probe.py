@@ -78,9 +78,13 @@ def compose_encoder_cfg(overrides: list[str]) -> DictConfig:
     `${hydra:runtime.cwd}` (in `paths.project_root`) resolve outside `@hydra.main`.
     """
     with initialize_config_dir(version_base=None, config_dir=str(CONFIG_DIR)):
+        # The step arm is a different workflow file, so let an override pick it
+        # rather than stacking two `workflow=` keys, which Hydra rejects.
+        workflow = [o for o in overrides if o.startswith("workflow=")]
+        rest = [o for o in overrides if not o.startswith("workflow=")]
         cfg = compose(
             config_name="run",
-            overrides=["workflow=encoder_train", *overrides],
+            overrides=[*(workflow or ["workflow=encoder_train"]), *rest],
             return_hydra_config=True,
         )
     HydraConfig.instance().set_config(cfg)
@@ -286,16 +290,22 @@ def naive_next_patch_loss(
     aux_ids: Tensor,
     aux_patch: Tensor,
     slot_positions: Tensor,
+    cond_slot: Tensor | None = None,
 ) -> Tensor:
-    """The specification executed literally: one sequence per (row, patch).
+    """The specification executed literally: one sequence per (row, unit).
 
-    `[row b's prefix through z_{m-1}; patch m's tokens]` with an ordinary causal mask
-    and default positions, first token predicted from the code, the rest from their
-    predecessor. Quadratic in the number of patches, so only for small checks -- it
-    is the oracle both the unit test and the real-model gate compare against.
+    `[row b's prefix through the unit's conditioning code; the unit's tokens]` with
+    an ordinary causal mask and default positions, first token predicted from the
+    code, the rest from their predecessor. Quadratic in the number of units, so only
+    for small checks -- it is the oracle both the unit test and the real-model gate
+    compare against.
+
+    `cond_slot[b, m]` names the slot conditioning unit m, which is `m - 1` for a
+    token patch and `last_latent_of_step[m-1]` for a `\n\n` step. `None` means the
+    former, so existing callers are unaffected.
 
     Returns `[sum_i mean_j mean_t CE, sum_t CE]`, the same pair the production path
-    returns: the per-row/per-patch means built here by literally averaging, against
+    returns: the per-row/per-unit means built here by literally averaging, against
     a single weighted sum there.
     """
     table, lm_head = backbone.embedding_weight, backbone.model.lm_head
@@ -308,7 +318,8 @@ def naive_next_patch_loss(
         patch_means = spliced.new_zeros((), dtype=torch.float32)
         for patch in unique:
             tokens = ids[patches == patch]
-            limit = int(slot_positions[row, patch - 1])
+            slot = patch - 1 if cond_slot is None else int(cond_slot[row, patch])
+            limit = int(slot_positions[row, slot])
             seq = torch.cat(
                 [
                     spliced[row : row + 1, : limit + 1],
@@ -469,6 +480,7 @@ def numeric_check(
         aux_patch[aux_patch > patches] = -1
         aux_ids = torch.where(aux_patch >= 0, batch["aux_ids"][row : row + 1], -100)
         slots = batch["slot_positions"][row : row + 1]
+        cond_slot = batch["cond_slot"][row : row + 1]
         prefix_len = batch["prefix_len"][row : row + 1]
         spliced = (
             backbone.splice(
@@ -484,9 +496,9 @@ def numeric_check(
 
         # Index 0 of both: the per-row/per-patch mean, which is the term that
         # carries the gradient to the codes.
-        expected = naive_next_patch_loss(backbone, spliced, aux_ids, aux_patch, slots)[
-            0
-        ]
+        expected = naive_next_patch_loss(
+            backbone, spliced, aux_ids, aux_patch, slots, cond_slot
+        )[0]
         (want,) = torch.autograd.grad(expected, spliced)
 
         def errors(corrupt: bool) -> tuple[float, float]:

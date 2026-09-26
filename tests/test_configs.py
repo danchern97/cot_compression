@@ -127,6 +127,10 @@ def test_encoder_workflow_composes() -> None:
         assert cfg.encoder.codebook_size == 64
         assert cfg.encoder.latent_init == "random"
         assert cfg.encoder.patching == "uniform"
+        # Both default-preserving: an existing checkpoint is a VQ encoder with the
+        # historical shared anchor, and must keep reading as one.
+        assert cfg.encoder.use_vq is True
+        assert cfg.encoder.query_anchor == "step"
         assert cfg.encoder.memory_layer == -1
         assert cfg.evaluation.methods.patching.compression_ratio == 4.0
 
@@ -244,3 +248,48 @@ def test_eval_split_selection_is_corpus_agnostic() -> None:
             raise AssertionError("expected an unknown-split error")
         except ValueError as error:
             assert "Unknown evaluation.split" in str(error)
+
+
+def test_encoder_step_workflow_composes() -> None:
+    """The step arm, and that it cannot collide with the campaign already running.
+
+    `run_name` is both the run directory and the W&B run id, so a shared `run_tag`
+    would put two campaigns on one checkpoint and `resume_from_checkpoint=auto`
+    would load the other's weights. The baseline's `run_name` is pinned LITERALLY
+    here for the same reason: drifting that template would orphan the existing
+    campaign's checkpoints rather than fail.
+    """
+    config_dir = str(Path(__file__).resolve().parents[1] / "configs")
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        cfg = compose(
+            config_name="run",
+            overrides=["workflow=encoder_train_step", "logging.enabled=false"],
+        )
+        base = compose(
+            config_name="run",
+            overrides=["workflow=encoder_train", "logging.enabled=false"],
+        )
+
+        # Same mode, so one WORKFLOWS entry serves both -- the `sft06b` precedent.
+        assert cfg.mode == "encoder_train" == base.mode
+        assert cfg.encoder.patching == "paragraph"
+        assert cfg.encoder.use_vq is False
+        assert cfg.encoder.latent_init == "step_mean"
+        assert cfg.encoder.query_anchor == "step"
+        # Inherited from `baseline` through the defaults list, not re-stated.
+        assert cfg.encoder.n_blocks == base.encoder.n_blocks
+        assert cfg.encoder.position_encoding == "rope"
+        # Paragraph segmentation needs no per-token signal, so no control may ask
+        # for one either: `surprisal_t0`, which the baseline arm uses, would demand
+        # a cache this arm never builds. `random` is signal-free and stays.
+        assert list(cfg.encoder.eval_controls) == ["random", "step_mean"]
+        assert "surprisal_t0" in list(base.encoder.eval_controls)
+
+        assert (
+            base.run_name
+            == "enc-qwen3-0.6b_cr4.0_c64_uniform_random_causal-causal_perope_np1.0_lr0.0003"
+        )
+        assert cfg.run_tag != base.run_tag
+        assert cfg.run_name != base.run_name
+        assert cfg.paths.run_dir != base.paths.run_dir
+        assert "_paragraph_" in cfg.run_name and "vqFalse" in cfg.run_name

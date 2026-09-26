@@ -60,6 +60,11 @@ methods:
     patching: null
   simple_mean:
     patching: null
+  # Every latent of a paragraph step holds that step's mean embedding: the step
+  # encoder's initialization, and so the control it must beat. Only meaningful
+  # with `paragraph`; under token patching it is a per-patch mean.
+  step_mean:
+    patching: paragraph
   entropy_weighted_mean:
     patching: null
     # softmax(ln H / T) pooling temperature: T=1 -> plain entropy-weighted mean,

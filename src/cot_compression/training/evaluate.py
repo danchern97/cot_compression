@@ -25,6 +25,7 @@ from cot_compression.compression import (
 )
 from cot_compression.data.answers import (
     cot_token_ids,
+    cot_token_ids_and_offsets,
     extract_answer_trace,
     prefix_token_ids,
     tokenize_answer,
@@ -32,12 +33,14 @@ from cot_compression.data.answers import (
 from cot_compression.data.chat import IGNORE_INDEX
 from cot_compression.data.dolci import load_dolci_sft_data
 from cot_compression.data.dolci_traces import load_trace_data
+from cot_compression.patching import SplitContext
 from cot_compression.signals import (
     compute_cot_signals,
     load_signal_cache,
     save_entropies_npz,
     signal_cache_path,
 )
+from cot_compression.steps import StepLayout
 from cot_compression.training.logging import RunLogger
 from cot_compression.training.sft import parse_torch_dtype
 from cot_compression.training.utils import (
@@ -245,6 +248,13 @@ class PreparedSample:
     # Populated only when the method declares requires_prefix(): rendering the
     # prompt through the chat template is not free at eval scale.
     prefix_ids: list[int] | None = None
+    # Populated only when the patching declares requires_context(). The worker
+    # resolves the segmentation ONCE and ships it, rather than shipping the text and
+    # letting the main process re-derive it: `plan` and `materialize` disagreeing on
+    # K makes `evaluate_method` drop the sample, and for the learned method a
+    # re-derivation would also mean anchors it never trained under. Shipping the
+    # layout removes both by construction, and is smaller over IPC than text+offsets.
+    step_layout: StepLayout | None = None
 
 
 class PrepDataset(TorchDataset["PreparedSample | None"]):
@@ -295,14 +305,45 @@ class PrepDataset(TorchDataset["PreparedSample | None"]):
     def __len__(self) -> int:
         return self.limit
 
-    def _num_slots(self, sample_index: int, num_cot_tokens: int) -> int | None:
+    def _num_slots(
+        self,
+        sample_index: int,
+        num_cot_tokens: int,
+        context: SplitContext | None = None,
+    ) -> int | None:
         """Slot count from the main process, or planned here when independent."""
         if self.span_counts is not None:
             return self.span_counts[sample_index]
         plan = self.method.plan(
-            num_cot_tokens, sample_index, self.seed, None, torch.device("cpu")
+            num_cot_tokens, sample_index, self.seed, None, torch.device("cpu"), context
         )
         return plan.num_slots
+
+    def _step_context(self, trace: Any, sample_index: int) -> SplitContext | None:
+        """Resolve the segmentation here, in the worker that holds the text.
+
+        Returned as a resolved layout rather than as text+offsets, so `plan` and the
+        main process's later `materialize` consume the same object and cannot
+        disagree on K -- a disagreement `evaluate_method` answers by dropping the
+        sample, and which for the learned method would instead mean cross-attention
+        anchors it never trained under.
+
+        Signal-free and deterministic -- integer and regex arithmetic over the trace
+        string -- so unlike the signal strategies there is no CPU/GPU boundary shift
+        to worry about and `signal_span_counts` is correctly bypassed.
+        """
+        patching = self.method.patching
+        if patching is None or not patching.requires_context():
+            return None
+        cot_ids, offsets = cot_token_ids_and_offsets(trace, self.tokenizer)
+        layout = patching.layout(
+            len(cot_ids),
+            sample_index,
+            self.seed,
+            None,
+            context=SplitContext(text=trace.trace, offsets=offsets),
+        )
+        return SplitContext(layout=layout)
 
     def __getitem__(self, index: int) -> PreparedSample | None:
         # Named `index` to match Dataset.__getitem__; it is a dataset sample index.
@@ -340,7 +381,12 @@ class PrepDataset(TorchDataset["PreparedSample | None"]):
             # No signal values for this sample: the serial path raised inside
             # compress() and skipped it, so skip it here too.
             return None
-        num_slots = self._num_slots(sample_index, len(cot_ids))
+        # Not guarded by `except ValueError: return None`, unlike the tokenization
+        # above: the CoT is already known to be non-empty here, so the only thing
+        # left that can raise is a layout invariant -- a bug, which must crash the
+        # worker rather than quietly shrink the scored population.
+        context = self._step_context(trace, sample_index)
+        num_slots = self._num_slots(sample_index, len(cot_ids), context)
 
         tokenized = tokenize_answer(
             tokenizer=self.tokenizer,
@@ -379,6 +425,7 @@ class PrepDataset(TorchDataset["PreparedSample | None"]):
                 if self.method.requires_prefix()
                 else None
             ),
+            step_layout=None if context is None else context.layout,
         )
 
 
@@ -972,6 +1019,11 @@ def evaluate_method(
                     for name in required_signals
                 },
                 prepared.prefix_ids,
+                # The worker's own layout, not a re-derivation: `plan` used exactly
+                # this, so the two cannot disagree on K.
+                None
+                if prepared.step_layout is None
+                else SplitContext(layout=prepared.step_layout),
             )
         except ValueError:
             # Patching/pooling wanted a signal this sample has none of, which the

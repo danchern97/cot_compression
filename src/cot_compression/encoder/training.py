@@ -19,6 +19,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from datasets import DatasetDict
 from omegaconf import DictConfig
 from torch import Tensor, nn
@@ -40,6 +41,7 @@ from cot_compression.compression import (
 from cot_compression.compression import _regular_vocab_bound as regular_vocab_bound
 from cot_compression.data.answers import (
     cot_token_ids,
+    cot_token_ids_and_offsets,
     extract_answer_trace,
     prefix_token_ids,
     tokenize_answer,
@@ -54,6 +56,7 @@ from cot_compression.encoder.model import (
     LatentInit,
     MaskMode,
     PositionEncoding,
+    QueryAnchor,
 )
 from cot_compression.encoder.next_patch import (
     NextPatchBatch,
@@ -63,8 +66,9 @@ from cot_compression.encoder.next_patch import (
     natural_width,
     patch_weights,
 )
-from cot_compression.patching import PatchingMethod
+from cot_compression.patching import PatchingMethod, SplitContext
 from cot_compression.signals import load_signal_cache, signal_cache_path
+from cot_compression.steps import StepLayout
 from cot_compression.training.logging import RunLogger
 from cot_compression.training.sft import (
     BatchPlan,
@@ -89,9 +93,17 @@ from cot_compression.training.utils import (
 )
 
 # The initializers that reduce to ONE token id per slot, and so can be prepared in
-# a DataLoader worker with no embedding table. `simple_mean` averages embeddings
-# and is excluded.
-TOKEN_LATENT_INITS = tuple(n for n in LATENT_INITS if n != "simple_mean")
+# a DataLoader worker with no embedding table. The two that average embeddings,
+# `simple_mean` and `step_mean`, are excluded -- see `POOLED_LATENT_INITS`.
+TOKEN_LATENT_INITS = tuple(
+    n for n in LATENT_INITS if n not in ("simple_mean", "step_mean")
+)
+# Initializers that average CoT embeddings instead of picking one token. A worker
+# cannot evaluate them -- it holds no embedding table -- so it ships the bag
+# partition and the main process does one `embedding_bag`. `step_mean` pools a whole
+# step and shares it across that step's latents; `simple_mean` pools each latent's
+# own sub-span, which is what `SimpleMeanCompressionMethod` means by the name.
+POOLED_LATENT_INITS = ("step_mean", "simple_mean")
 
 # Cap on the k-means sample. Bounds the [N, |C|] distance matrix at 268 MB, and is
 # also the target: >=64 points per centroid at |C|=1024, ~1000 at |C|=64.
@@ -99,6 +111,10 @@ _KMEANS_MAX_SAMPLES = 65536
 # Micro-batches the seeding pass may consume before giving up on reaching the
 # target. Only binds when the shuffled plan opens with very short rows.
 _KMEANS_MAX_BATCHES = 64
+
+# Slots the within-step cosine diagnostic reads per micro-batch, across all rows.
+# Bounds its [buckets, d] scratch buffer at ~8 MB; see `_measure_step_cosines`.
+_COSINE_MAX_SLOTS = 2048
 
 ENCODER_WEIGHTS = "encoder.pt"
 ENCODER_CONFIG = "encoder_config.json"
@@ -119,7 +135,17 @@ _ARCHITECTURE_FIELDS = (
     # refusal instead.
     "position_encoding",
     "rope_theta",
+    # Changes where every cross-attention query sits, so a checkpoint resumed under
+    # the other value would be learning a different function from step one.
+    "query_anchor",
+    # Whether there is a codebook at all. A VQ checkpoint loaded into a continuous
+    # encoder dies inside `load_state_dict` on the missing `quantizer.*` keys; this
+    # turns that into a message naming the field.
+    "use_vq",
 )
+# Meaningless once `use_vq` is False -- there is no codebook for it to size -- so
+# comparing it would refuse a resume over a field that changes nothing.
+_VQ_ONLY_FIELDS = ("codebook_size",)
 
 
 @dataclass
@@ -136,9 +162,33 @@ class PreparedEncoderSample:
     input_ids: list[int]
     labels: list[int]
     slot_positions: list[int]
-    # prompt_len + span_end per slot: the exclusive bound on the memory index a
-    # slot may attend to under a causal cross mask.
+    # prompt_len + STEP end per slot: the exclusive bound on the memory index a
+    # slot may attend to under a causal cross mask. Every latent of a step shares
+    # it, so each sees its whole step; with one-latent-per-step patching (uniform)
+    # it reduces to prompt_len + span_end, its historical value.
     cross_limit: list[int]
+    # prompt_len + the latent's OWN sub-span end, which is where its cross-attention
+    # RoPE query sits. None unless `query_anchor="substep"`: by default a step's
+    # latents share the step-end anchor, and `CoTEncoder` then falls back to
+    # `cross_limit` exactly as before.
+    query_limit: list[int] | None
+    # Slot index of the latent each STEP conditions on, i.e.
+    # `last_latent_of_step[m-1]`; entry 0 is unused because step 0 is never a
+    # target. Length is the step count, not the slot count.
+    cond_slot: list[int]
+    # Which step each slot belongs to. The within-step collapse diagnostic groups
+    # latents by it, and `step_mean`'s `init_bag_of_slot` is derived from it.
+    step_of_latent: list[int]
+    # The CoT token ids grouped by step (== cot_ids, since steps tile the trace)
+    # and each step's start, for the `embedding_bag` that builds `step_mean`.
+    # Empty for the token-id initializers.
+    init_bag_ids: list[int]
+    init_bag_offsets: list[int]
+    # Which bag each slot averages. `step_of_latent` for `step_mean`, the slot's own
+    # index for `simple_mean`. Emitted rather than inferred from the bag count: the
+    # two coincide whenever every step holds one latent, so an inference would be
+    # right by accident and wrong the moment a third pooled initializer existed.
+    init_bag_of_slot: list[int]
     init_ids: list[int]
     # Auxiliary next-patch supervision. `aux_ids` are the CoT tokens of the
     # SUPERVISED patches, concatenated in order; `aux_patch` gives each one its
@@ -172,12 +222,23 @@ class EncoderPrepDataset(TorchDataset["PreparedEncoderSample | None"]):
         latent_init: str,
         signals: dict[int, Tensor] | None = None,
         next_patch_subsample: float = 1.0,
+        query_anchor: str = "step",
     ) -> None:
-        if latent_init not in TOKEN_LATENT_INITS:
-            raise NotImplementedError(
-                f"latent_init={latent_init!r} averages CoT embeddings, which needs "
-                "the embedding table and so cannot be prepared worker-side. "
-                f"{TOKEN_LATENT_INITS} all reduce to one token id per slot."
+        if (
+            latent_init not in TOKEN_LATENT_INITS
+            and latent_init not in POOLED_LATENT_INITS
+        ):
+            raise ValueError(
+                f"Unknown latent_init {latent_init!r}. Token initializers "
+                f"{TOKEN_LATENT_INITS} reduce to one id per slot; pooled ones "
+                f"{POOLED_LATENT_INITS} ship a bag partition for the main process "
+                "to average with the embedding table workers do not hold."
+            )
+        self.needs_context = patching.requires_context()
+        self.query_anchor = query_anchor
+        if query_anchor not in ("step", "substep"):
+            raise ValueError(
+                f"query_anchor must be 'step' or 'substep', got {query_anchor!r}."
             )
         needed = {patching.required_signal()} - {None}
         if latent_init.endswith("_t0"):
@@ -207,8 +268,14 @@ class EncoderPrepDataset(TorchDataset["PreparedEncoderSample | None"]):
         trace = extract_answer_trace(example["messages"])
         if trace is None:
             return None
+        context = None
         try:
-            cot_ids = cot_token_ids(trace, self.tokenizer)
+            if self.needs_context:
+                # Offsets cost ~24% on this call, so only a text-aware strategy pays.
+                cot_ids, offsets = cot_token_ids_and_offsets(trace, self.tokenizer)
+                context = SplitContext(text=trace.trace, offsets=offsets)
+            else:
+                cot_ids = cot_token_ids(trace, self.tokenizer)
         except ValueError:
             return None
         prompt_ids = prefix_token_ids(trace, self.tokenizer)
@@ -224,8 +291,11 @@ class EncoderPrepDataset(TorchDataset["PreparedEncoderSample | None"]):
             values = self.signals.get(index)
             if values is None:
                 return None
-        spans = self.patching.split(len(cot_ids), index, self.seed, values)
-        num_slots = len(spans)
+        layout = self.patching.layout(
+            len(cot_ids), index, self.seed, values, context=context
+        )
+        spans = list(layout.latents)
+        num_slots = layout.num_latents
         tokenized = tokenize_answer(
             tokenizer=self.tokenizer,
             messages=compressed_messages(trace, num_slots),
@@ -247,15 +317,42 @@ class EncoderPrepDataset(TorchDataset["PreparedEncoderSample | None"]):
             return None
 
         prompt_len = len(prompt_ids)
-        aux_ids, aux_patch = self._aux_targets(cot_ids, spans, index)
+        # Steps, not latent sub-spans: the aux objective predicts a whole step from
+        # the last code before it.
+        aux_ids, aux_patch = self._aux_targets(cot_ids, list(layout.steps), index)
+        pooled = self.latent_init in POOLED_LATENT_INITS
         return PreparedEncoderSample(
             sample_index=index,
             context_ids=prompt_ids + cot_ids,
             input_ids=tokenized.input_ids,
             labels=tokenized.labels,
             slot_positions=slot_positions,
-            cross_limit=[prompt_len + end for _, end in spans],
-            init_ids=self._init_ids(cot_ids, spans, index, values),
+            cross_limit=[
+                prompt_len + layout.steps[step][1] for step in layout.step_of_latent
+            ],
+            query_limit=(
+                [prompt_len + end for _, end in spans]
+                if self.query_anchor == "substep"
+                else None
+            ),
+            cond_slot=[0]
+            + [
+                layout.last_latent_of_step[step - 1]
+                for step in range(1, layout.num_steps)
+            ],
+            step_of_latent=list(layout.step_of_latent),
+            init_bag_ids=cot_ids if pooled else [],
+            init_bag_offsets=(
+                [start for start, _ in self._init_bags(layout)] if pooled else []
+            ),
+            init_bag_of_slot=(
+                list(layout.step_of_latent)
+                if self.latent_init == "step_mean"
+                else list(range(layout.num_latents))
+            )
+            if pooled
+            else [],
+            init_ids=[] if pooled else self._init_ids(cot_ids, spans, index, values),
             aux_ids=aux_ids,
             aux_patch=aux_patch,
             # Pass B's own prefix, through the last code. Reusing it means the codes
@@ -292,6 +389,17 @@ class EncoderPrepDataset(TorchDataset["PreparedEncoderSample | None"]):
             ids.extend(cot_ids[start:end])
             patch.extend([position] * (end - start))
         return ids, patch
+
+    def _init_bags(self, layout: StepLayout) -> list[tuple[int, int]]:
+        """Which CoT tokens each pooled initializer averages, one bag per slot group.
+
+        `step_mean` pools a whole step and shares the result across its latents;
+        `simple_mean` pools each latent's own sub-span. Both tile the trace, so the
+        flat id list is just `cot_ids` and only the offsets differ -- which is what
+        keeps the bag total at L rather than the sum of per-latent step lengths
+        (880 latents x 3518 tokens for one real step).
+        """
+        return list(layout.steps if self.latent_init == "step_mean" else layout.latents)
 
     def _init_ids(
         self,
@@ -343,7 +451,7 @@ def collate_encoder_batch(
     context_mask = _pad([[1] * len(s.context_ids) for s in samples], 0).bool()
     input_ids = _pad([s.input_ids for s in samples], pad_token_id)
     attention_mask = _pad([[1] * len(s.input_ids) for s in samples], 0)
-    return {
+    batch: dict[str, Tensor] = {
         "context_ids": context,
         "context_mask": context_mask,
         "input_ids": input_ids,
@@ -352,7 +460,12 @@ def collate_encoder_batch(
         "slot_positions": _pad([s.slot_positions for s in samples], 0),
         "slot_mask": _pad([[1] * s.num_slots for s in samples], 0).bool(),
         "cross_limit": _pad([s.cross_limit for s in samples], 1),
-        "init_ids": _pad([s.init_ids for s in samples], 0),
+        # Pads with 0, a valid slot index. Entry 0 of every row is already unused
+        # (step 0 is never a target), and the gather runs before the mask, so the
+        # index must be in range even where the value is never read.
+        "cond_slot": _pad([s.cond_slot for s in samples], 0),
+        "step_of_latent": _pad([s.step_of_latent for s in samples], 0),
+        "init_ids": _pad([s.init_ids or [0] for s in samples], 0),
         # `aux_patch` pads with -1, the "not a target" sentinel that both the mask
         # and the gather test against. A row with no supervised patches still needs
         # a column, so the width floors at 1.
@@ -360,6 +473,92 @@ def collate_encoder_batch(
         "aux_patch": _pad([s.aux_patch or [-1] for s in samples], -1),
         "prefix_len": torch.tensor([s.prefix_len for s in samples], dtype=torch.long),
     }
+    # OMITTED rather than set to None when unused, because `run_training` moves every
+    # value of this dict to the device and `forward` takes them as **kwargs -- an
+    # absent key falls through to the parameter default, a None value would not.
+    if samples[0].query_limit is not None:
+        # Same pad value as `cross_limit`, for the same reason: a padded slot's RoPE
+        # anchor is `limit - 1`, and 0 would put it below zero.
+        batch["query_limit"] = _pad([s.query_limit or [1] for s in samples], 1)
+    if samples[0].init_bag_offsets:
+        batch.update(_init_bag_batch(samples))
+    return batch
+
+
+def _init_bag_batch(samples: list[PreparedEncoderSample]) -> dict[str, Tensor]:
+    """Flatten every row's pooled-init bags into ONE `embedding_bag` call.
+
+    `embedding_bag` takes a flat id list and a flat offsets list, so the rows are
+    concatenated and each row's offsets shifted by where its ids start. The result
+    is `[total_bags, d]`, and `init_bag_of_slot` says which of those rows each slot
+    reads -- which is how `step_mean` gives a step's latents one shared vector
+    without materializing it per latent.
+    """
+    flat: list[int] = []
+    offsets: list[int] = []
+    bag_of_slot: list[list[int]] = []
+    for sample in samples:
+        base_ids, base_bag = len(flat), len(offsets)
+        flat.extend(sample.init_bag_ids)
+        offsets.extend(base_ids + start for start in sample.init_bag_offsets)
+        bag_of_slot.append([base_bag + index for index in sample.init_bag_of_slot])
+    return {
+        "init_bag_ids": torch.tensor(flat, dtype=torch.long),
+        "init_bag_offsets": torch.tensor(offsets, dtype=torch.long),
+        "init_bag_of_slot": _pad(bag_of_slot, 0),
+    }
+
+
+def latent_seed(
+    weight: Tensor,
+    latent_init: str,
+    init_ids: Tensor,
+    bag_ids: Tensor | None,
+    bag_offsets: Tensor | None,
+    bag_of_slot: Tensor | None,
+) -> Tensor:
+    """`[B, K, d]` seed vectors from a collated batch. A constant: detached.
+
+    The ONE place a seed is built from a batch, shared by training and by the
+    training-free controls in `eval_baselines`, so a control scores exactly the
+    vector the encoder starts from. Each pooled initializer matches its eval-harness
+    twin (`build_latent_init`) formula for formula:
+
+    * `simple_mean` is `sum / sqrt(c)` over each latent's own sub-span --
+      `SimpleMeanCompressionMethod`'s pooling, not an arithmetic mean;
+    * `step_mean` is the arithmetic mean over the latent's whole step, shared by the
+      step's latents -- `StepMeanCompressionMethod`.
+
+    Pooled per BAG and then indexed, never per slot, so the flat id list stays the
+    CoT length: a bag per latent would emit 880 x 3,518 ids for the longest real
+    step alone. Computed in the table's own dtype -- `weight.float()` would copy all
+    151,936 x 1024 rows (~622 MB) per forward to average a few thousand, and the
+    CUDA kernel already accumulates a bf16 bag in fp32.
+    """
+    if bag_ids is None:
+        if latent_init in POOLED_LATENT_INITS:
+            raise RuntimeError(
+                f"latent_init={latent_init!r} pools embeddings but the batch carries "
+                "no bags; the prep dataset and the encoder disagree on the init."
+            )
+        return weight[init_ids].detach()
+    assert bag_offsets is not None and bag_of_slot is not None
+    with torch.no_grad():
+        if latent_init == "step_mean":
+            pooled = F.embedding_bag(bag_ids, weight, bag_offsets, mode="mean")
+        elif latent_init == "simple_mean":
+            sums = F.embedding_bag(bag_ids, weight, bag_offsets, mode="sum")
+            ends = torch.cat(
+                [bag_offsets[1:], bag_offsets.new_tensor([bag_ids.numel()])]
+            )
+            lengths = (ends - bag_offsets).to(sums.dtype)
+            pooled = sums / lengths.sqrt().unsqueeze(-1)
+        else:
+            raise RuntimeError(
+                f"latent_init={latent_init!r} picks one token per slot, yet the batch "
+                "carries pooling bags; the prep dataset and the encoder disagree."
+            )
+    return pooled[bag_of_slot].detach()
 
 
 class EncoderTrainingModule(nn.Module):
@@ -409,6 +608,11 @@ class EncoderTrainingModule(nn.Module):
         # Dead codes seen by the last `reseed_dead_codes`, before it acted.
         self.last_dead_count = 0
         self.last_quant_rel_error: Tensor | None = None
+        # Within-step latent collapse. Tensors, not floats: reading them here would
+        # be a host sync per micro-batch.
+        self.last_within_step_cos: Tensor | None = None
+        self.last_across_step_cos: Tensor | None = None
+        self.last_within_step_pairs: Tensor | None = None
 
     # Index layout of `train_totals` / `eval_totals`. A named tuple of floats would
     # need a host sync per micro-batch; one stacked tensor stays on the device until
@@ -491,6 +695,12 @@ class EncoderTrainingModule(nn.Module):
         slot_mask: Tensor,
         cross_limit: Tensor,
         init_ids: Tensor,
+        step_of_latent: Tensor | None = None,
+        cond_slot: Tensor | None = None,
+        query_limit: Tensor | None = None,
+        init_bag_ids: Tensor | None = None,
+        init_bag_offsets: Tensor | None = None,
+        init_bag_of_slot: Tensor | None = None,
         aux_ids: Tensor | None = None,
         aux_patch: Tensor | None = None,
         prefix_len: Tensor | None = None,
@@ -514,7 +724,9 @@ class EncoderTrainingModule(nn.Module):
         `commit_weight`; both are now genuine per-row weights.
         """
         memory = self.backbone.encode_context(context_ids, context_mask)
-        latent = self.backbone.embedding_weight[init_ids].detach()
+        latent = self._latent_init(
+            init_ids, init_bag_ids, init_bag_offsets, init_bag_of_slot
+        )
 
         out = self.encoder(
             latent,
@@ -522,20 +734,22 @@ class EncoderTrainingModule(nn.Module):
             slot_mask,
             context_mask,
             cross_limit=cross_limit,
+            query_limit=query_limit,
         )
-        # Reduce before folding into the usage EMA. This is a collective, and it
-        # is safe here because every rank runs the same number of forwards:
-        # plan_epoch truncates micro-batches to a multiple of world_size, and
-        # plan_eval_batches does the same, so no rank can arrive alone.
-        counts = out.counts
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(counts)
-        if self.training:
-            # Training statistics only -- folding eval batches in would make
-            # utilization reflect a mixture of two different data distributions.
-            self.encoder.quantizer.update_usage(counts)
-        self.last_code_counts = counts.detach()
-        if self.training:
+        if self.encoder.quantizer is not None:
+            # Reduce before folding into the usage EMA. This is a collective, and it
+            # is safe here because every rank runs the same number of forwards:
+            # plan_epoch truncates micro-batches to a multiple of world_size, and
+            # plan_eval_batches does the same, so no rank can arrive alone.
+            counts = out.counts
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(counts)
+            if self.training:
+                # Training statistics only -- folding eval batches in would make
+                # utilization reflect a mixture of two different data distributions.
+                self.encoder.quantizer.update_usage(counts)
+            self.last_code_counts = counts.detach()
+        if self.training and self.encoder.quantizer is not None:
             # ||g - q|| / ||g||, the fraction of the encoder's output the
             # bottleneck discards. Kept as a tensor: `float()` here would be a
             # host sync on every micro-batch. `commit_weight` no longer restrains
@@ -546,7 +760,8 @@ class EncoderTrainingModule(nn.Module):
             self.last_quant_rel_error = (g - q).norm(dim=-1).mean() / g.norm(
                 dim=-1
             ).mean().clamp_min(1e-12)
-
+        if self.training:
+            self._measure_step_cosines(out.encoder_output, slot_mask, step_of_latent)
             valid = out.encoder_output[slot_mask]
             if valid.shape[0] > self.code_pool_size:
                 pick = torch.randperm(valid.shape[0], device=valid.device)
@@ -556,7 +771,7 @@ class EncoderTrainingModule(nn.Module):
         spliced = self.backbone.splice(input_ids, out.z, slot_positions, slot_mask)
         answer = self.backbone.answer_ce_weighted(spliced, attention_mask, labels)
         aux, aux_tokens, aux_rows = self._next_patch_loss(
-            spliced, aux_ids, aux_patch, prefix_len, slot_positions
+            spliced, aux_ids, aux_patch, prefix_len, slot_positions, cond_slot
         )
 
         quantizer = out.codebook_loss + self.commit_weight * out.commit_loss
@@ -578,6 +793,102 @@ class EncoderTrainingModule(nn.Module):
         )
         return torch.stack([answer[0] + quantizer, self.next_patch_weight * aux[0]])
 
+    def _latent_init(
+        self,
+        init_ids: Tensor,
+        bag_ids: Tensor | None,
+        bag_offsets: Tensor | None,
+        bag_of_slot: Tensor | None,
+    ) -> Tensor:
+        """`[B, K, d]` seed vectors for this encoder's `latent_init`; see `latent_seed`."""
+        return latent_seed(
+            self.backbone.embedding_weight,
+            self.encoder.config.latent_init,
+            init_ids,
+            bag_ids,
+            bag_offsets,
+            bag_of_slot,
+        )
+
+    @torch.no_grad()
+    def _measure_step_cosines(
+        self, hidden: Tensor, slot_mask: Tensor, step_of_latent: Tensor | None
+    ) -> None:
+        """Mean pairwise cosine between latents of the same step, and of different ones.
+
+        The only place within-step collapse is visible. A step's latents start from
+        one shared `step_mean` vector and, with the default step-scoped anchor, share
+        a cross-attention query position too -- so nothing but the causal
+        self-attention over slots separates them, and if that is not enough they
+        converge to near-duplicates while the loss falls perfectly happily. The same
+        lesson the codebook taught: perplexity went 7.55 -> 3.88 across 60 steps with
+        training loss monotone the whole way.
+
+        Read `within` against `across`: both near 1 is a scale artifact, `within`
+        alone near 1 means a long step is buying no capacity. `across` pools every
+        pair that is NOT in the same step, including pairs from different rows --
+        it is the baseline similarity of unrelated latents, not a per-trace figure.
+
+        No pairwise matrix and no host sync: that matrix over K up to 8,000 would be
+        64M entries, so this uses the identity
+        `mean_{i != j} cos = (|sum u_i|^2 - n) / (n(n-1))` on unit vectors, which
+        needs only a per-step sum.
+
+        Undefined, not zero, when no step holds two latents -- which is every batch
+        under one-latent-per-step patching. The pair count is kept so that
+        `codebook_metrics` can omit the metric then instead of reporting a 0.0 that
+        would read as "perfectly diverse" on the token-patching arm.
+        """
+        if step_of_latent is None or hidden.shape[1] == 0:
+            return
+        # Bucketing is over [rows * slots], and the per-bucket sum is [buckets, d] --
+        # 524 MB at 16 rows x 8,000 slots x 1024 dims. A diagnostic may not cost that,
+        # so it reads a per-row PREFIX. Contiguous, not a random subsample, because a
+        # prefix keeps each step's latents together; it biases toward early steps,
+        # which is acceptable for "did these collapse onto each other".
+        cap = max(2, _COSINE_MAX_SLOTS // max(1, hidden.shape[0]))
+        if hidden.shape[1] > cap:
+            hidden = hidden[:, :cap]
+            slot_mask = slot_mask[:, :cap]
+            step_of_latent = step_of_latent[:, :cap]
+        rows, width = step_of_latent.shape
+        keep = slot_mask.reshape(-1).float()
+        # Padded slots become the zero vector, so they contribute nothing to a sum
+        # and need no boolean index -- which would be a host sync per micro-batch.
+        unit = (F.normalize(hidden.float(), dim=-1) * slot_mask.unsqueeze(-1)).reshape(
+            -1, hidden.shape[-1]
+        )
+        # One bucket per (row, step); the row offset keeps rows from colliding.
+        keys = (
+            torch.arange(rows, device=step_of_latent.device).unsqueeze(1) * width
+            + step_of_latent.clamp_min(0) * slot_mask
+        ).reshape(-1)
+
+        sums = torch.zeros(rows * width, unit.shape[-1], device=unit.device)
+        sums.index_add_(0, keys, unit)
+        counts = torch.zeros(rows * width, device=unit.device)
+        counts.index_add_(0, keys, keep)
+
+        # For unit vectors, sum_{i != j} cos(u_i, u_j) = |sum u_i|^2 - n. No mask on
+        # small buckets is needed: at n = 1 that is 1 - 1 = 0 and at n = 0 it is 0,
+        # so empty and singleton steps drop out on their own -- which also keeps this
+        # free of the `[pairs > 0]` boolean index.
+        pairs = counts * (counts - 1.0)
+        within_num = (sums.pow(2).sum(-1) - counts).sum()
+        within_pairs = pairs.sum()
+
+        total = unit.sum(0)
+        n = keep.sum()
+        all_num = total.pow(2).sum() - n
+        all_pairs = n * (n - 1.0)
+        # Every term stays a device tensor; `codebook_metrics` reads them once per
+        # logging interval, as it does `last_quant_rel_error`.
+        self.last_within_step_pairs = within_pairs
+        self.last_within_step_cos = within_num / within_pairs.clamp_min(1.0)
+        self.last_across_step_cos = (all_num - within_num) / (
+            all_pairs - within_pairs
+        ).clamp_min(1.0)
+
     def _next_patch_loss(
         self,
         spliced: Tensor,
@@ -585,8 +896,9 @@ class EncoderTrainingModule(nn.Module):
         aux_patch: Tensor | None,
         prefix_len: Tensor | None,
         slot_positions: Tensor,
+        cond_slot: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Predict each patch's tokens from the codes before it.
+        """Predict each unit's tokens from the codes before it.
 
         Returns `([sum_i mean_j mean_t CE, sum_t CE], aux tokens, rows with a patch)`.
         Each row is `[its Pass B prefix through the last code; its supervised
@@ -622,6 +934,7 @@ class EncoderTrainingModule(nn.Module):
             aux_ids=aux_ids,
             aux_patch=aux_patch,
             prefix_len=prefix_len,
+            cond_slot=cond_slot,
             width=width,
         )
         if plan.num_targets == 0:
@@ -685,8 +998,11 @@ def step_denominators(device: torch.device, batches: list[dict[str, Tensor]]) ->
     ranks. Per-micro-batch means would: each group would carry a weight its own row
     count decided.
 
-    The second entry excludes rows with no supervised patch, which is what
-    `_next_patch_loss` scores. Only reachable with `next_patch_subsample < 1`.
+    The second entry excludes rows with no supervised unit, which is what
+    `_next_patch_loss` scores. Reachable without subsampling under paragraph
+    patching: 1.9% of traces contain no `\n\n` at all, so they are a single step
+    and step 0 is never a target. Excluding them is right -- their per-row loss
+    does not exist -- and is why this is a separate denominator rather than `rows`.
     """
     rows = sum(int(batch["labels"].shape[0]) for batch in batches)
     with_patches = sum(
@@ -744,10 +1060,15 @@ def check_encoder_architecture(config: EncoderConfig, directory: Path) -> None:
     # checkpoint actually trained with -- `position_encoding` defaults to "none"
     # precisely so a pre-RoPE checkpoint compares as the encoder it is.
     defaults = {spec.name: spec.default for spec in fields(EncoderConfig)}
+    compared = set(_ARCHITECTURE_FIELDS)
+    # Two continuous encoders differing only in a codebook size neither has are the
+    # same encoder; refusing over it would be a false alarm on a dead field.
+    if not config.use_vq and not found.get("use_vq", defaults["use_vq"]):
+        compared -= set(_VQ_ONLY_FIELDS)
     moved = [
         f"{key}: checkpoint has {found.get(key, defaults[key])!r}, config has {value!r}"
         for key, value in want.items()
-        if key in _ARCHITECTURE_FIELDS and found.get(key, defaults[key]) != value
+        if key in compared and found.get(key, defaults[key]) != value
     ]
     if moved:
         raise ValueError(
@@ -834,6 +1155,8 @@ def build_encoder_config(
             PositionEncoding, str(encoder_cfg.get("position_encoding", "none"))
         ),
         rope_theta=float(encoder_cfg.get("rope_theta", 1_000_000.0)),
+        use_vq=bool(encoder_cfg.get("use_vq", True)),
+        query_anchor=cast(QueryAnchor, str(encoder_cfg.get("query_anchor", "step"))),
         soft_assign_temperature=float(encoder_cfg.soft_assign_temperature),
         commit_weight=float(encoder_cfg.commit_weight),
         dead_code_threshold=float(encoder_cfg.dead_code_threshold),
@@ -922,6 +1245,7 @@ def build_encoder_data(
     latent_init: str,
     next_patch_subsample: float,
     world_size: int,
+    query_anchor: str = "step",
 ) -> EncoderData:
     measured = load_trace_lengths(cfg)
     train_lengths, train_starts = plan_columns(measured["train"])
@@ -952,6 +1276,7 @@ def build_encoder_data(
             vocab_bound=vocab_bound,
             latent_init=latent_init,
             next_patch_subsample=next_patch_subsample,
+            query_anchor=query_anchor,
         ),
     )
 
@@ -1116,6 +1441,7 @@ def kmeans_init_codebook(
             moved["slot_mask"],
             moved["context_mask"],
             cross_limit=moved["cross_limit"],
+            query_limit=moved.get("query_limit"),
         )
         parts.append(hidden[moved["slot_mask"]].float())
         collected += int(parts[-1].shape[0])
@@ -1130,6 +1456,11 @@ def kmeans_init_codebook(
         pool = pool[pick[:_KMEANS_MAX_SAMPLES]]
 
     quantizer = module.encoder.quantizer
+    if quantizer is None:
+        raise RuntimeError(
+            "kmeans_init_codebook called on a continuous encoder (use_vq=False); "
+            "there is no codebook to seed. The caller should not have reached here."
+        )
     quantizer.init_codebook_from_encoder_outputs(pool, generator, iters=iters)
     if world_size > 1:
         dist.broadcast(quantizer.codebook.data, src=0)
@@ -1246,11 +1577,16 @@ def train_encoder(cfg: DictConfig) -> Path:
         # The codebook is left at its placeholder here and seeded by k-means over
         # a real batch below, once the datasets exist. Deliberately NOT on resume:
         # the checkpoint's codebook is the trained one.
+    # `|C|` only when there is a codebook: a size for one that does not exist reads
+    # as a real hyperparameter in a log someone greps later.
+    quantizer_label = (
+        f"vq |C|={encoder_config.codebook_size}" if encoder_config.use_vq else "none"
+    )
     logger.info(
         f"encoder: {sum(p.numel() for p in encoder.parameters()) / 1e6:.1f}M parameters, "
-        f"d_llm={encoder_config.d_llm}, |C|={encoder_config.codebook_size}, "
+        f"d_llm={encoder_config.d_llm}, quantizer={quantizer_label}, "
         f"masks={encoder_config.self_attn_mask}/{encoder_config.cross_attn_mask}, "
-        f"init={encoder_config.latent_init}"
+        f"init={encoder_config.latent_init}, patching={cfg.encoder.patching}"
     )
 
     optimizer = build_optimizer(cfg, encoder)
@@ -1261,6 +1597,7 @@ def train_encoder(cfg: DictConfig) -> Path:
         latent_init=encoder_config.latent_init,
         next_patch_subsample=encoder_config.next_patch_subsample,
         world_size=world_size,
+        query_anchor=encoder_config.query_anchor,
     )
     measured, plan, prep = data.measured, data.plan, data.prep
     logger.info(
@@ -1346,7 +1683,7 @@ def train_encoder(cfg: DictConfig) -> Path:
         _build_loader, cfg=cfg, pad_token_id=int(tokenizer.pad_token_id)
     )
 
-    if resume_dir is None:
+    if resume_dir is None and encoder_config.use_vq:
         # After the datasets exist and before the first optimizer step: the
         # codebook must be seeded from encoder outputs the encoder actually
         # produces, which needs real batches. EnCodec's "first training batch",
@@ -1449,10 +1786,30 @@ def codebook_metrics(state: Any) -> dict[str, float]:
     inner = getattr(module, "module", module)
     encoder = inner.encoder
     quantizer = encoder.quantizer
-    size = quantizer.config.codebook_size
     pool = inner.code_pool
-    return {
+    report = {
         **{f"train/{name}": value for name, value in inner.pop_totals(True).items()},
+        # The scale contract, and the one `enc/` metric that matters with or without
+        # a codebook: with `z = g` spliced straight into `inputs_embeds`, `out_norm`
+        # is the only thing holding the codes at the decoder's embedding scale.
+        "enc/encoder_output_rms": (
+            float(pool.detach().pow(2).mean(-1).sqrt().mean())
+            if pool is not None
+            else 0.0
+        ),
+    }
+    # Within-step collapse: whether a step's several latents say different things.
+    # Absent, not 0.0, when nothing measured them OR no step held two latents --
+    # 0.0 is a meaningful cosine, so a token-patching run must not report one.
+    pairs = inner.last_within_step_pairs
+    if inner.last_within_step_cos is not None and pairs is not None and float(pairs):
+        report["enc/within_step_cos"] = float(inner.last_within_step_cos)
+        report["enc/across_step_cos"] = float(inner.last_across_step_cos)
+    if quantizer is None:
+        return report
+    size = quantizer.config.codebook_size
+    return {
+        **report,
         **codebook_geometry(quantizer.codebook.detach()),
         # The effective fraction of the codebook in use, exp(entropy)/|C|: 1.0 is
         # uniform, 1/|C| is total collapse. Normalized, so comparable across sizes.
@@ -1467,14 +1824,6 @@ def codebook_metrics(state: Any) -> dict[str, float]:
         "vq/quant_rel_error": (
             float(inner.last_quant_rel_error)
             if inner.last_quant_rel_error is not None
-            else 0.0
-        ),
-        # The scale contract: the encoder's outputs and the codebook must stay one
-        # distribution at the decoder's embedding scale (~0.029). Drifting apart is
-        # the failure that killed an earlier campaign.
-        "enc/encoder_output_rms": (
-            float(pool.detach().pow(2).mean(-1).sqrt().mean())
-            if pool is not None
             else 0.0
         ),
         "enc/codebook_rms": float(quantizer.codebook.detach().pow(2).mean().sqrt()),
@@ -1600,7 +1949,7 @@ def baseline_answer_losses(
             counts[name] += int((labels[:, 1:] != IGNORE_INDEX).sum())
             row_counts[name] += int(labels.shape[0])
         for name, prep in controls.items():
-            row_sum, token_sum, tokens, scored_rows = _token_init_control_ce(
+            row_sum, token_sum, tokens, scored_rows = _init_control_ce(
                 backbone, prep, rows, device
             )
             row_sums[name] += row_sum
@@ -1625,12 +1974,15 @@ def baseline_answer_losses(
 
 
 @torch.no_grad()
-def _token_init_control_ce(
+def _init_control_ce(
     backbone: FrozenBackbone, prep: Any, rows: list[int], device: torch.device
 ) -> tuple[float, float, int, int]:
-    """`(per-row CE sum, per-token CE sum, answer tokens, rows)` for a token init.
+    """`(per-row CE sum, per-token CE sum, answer tokens, rows)` for an init control.
 
-    Each slot holds `init_ids`' embedding and no encoder runs.
+    Each slot holds that initializer's seed -- built by `latent_seed`, the same
+    function training uses -- and no encoder runs. For `step_mean` this is the
+    paragraph encoder's own starting point, so the control asks whether training
+    beat it.
 
     Reuses `EncoderPrepDataset` rather than reimplementing span planning, so K and
     the spans match the encoder's per row exactly and the control is paired with
@@ -1646,7 +1998,14 @@ def _token_init_control_ce(
         return 0.0, 0.0, 0, 0
     batch = collate_encoder_batch(kept, pad_token_id=int(prep.tokenizer.pad_token_id))
     moved = {key: value.to(device) for key, value in batch.items()}
-    codes = backbone.embedding_weight[moved["init_ids"]].detach()
+    codes = latent_seed(
+        backbone.embedding_weight,
+        prep.latent_init,
+        moved["init_ids"],
+        moved.get("init_bag_ids"),
+        moved.get("init_bag_offsets"),
+        moved.get("init_bag_of_slot"),
+    )
     spliced = backbone.splice(
         moved["input_ids"], codes, moved["slot_positions"], moved["slot_mask"]
     )
@@ -1715,6 +2074,8 @@ def with_injected_fault(post_step: Any, fault: Any, rank: int) -> Any:
 def reseed_dead_codes(state: Any) -> None:
     """Jukebox-style random restarts (arXiv:2005.00341), run after EVERY step.
 
+    A no-op without a codebook.
+
     No warmup and no interval, matching every reference implementation (Jukebox
     `update_k`, EnCodec `core_vq`, lucidrains `expire_codes_`, vqtorch
     `ReplaceLRU`): they all replace on every forward, so a dead code is caught
@@ -1740,6 +2101,8 @@ def reseed_dead_codes(state: Any) -> None:
     """
     module = getattr(state.module, "module", state.module)
     quantizer = module.encoder.quantizer
+    if quantizer is None:
+        return
     # Measured and recorded unconditionally, BEFORE the enable check. Behind it,
     # a run with restarts disabled reported zero dead codes forever -- the metric
     # would have been blind on exactly the ablation that needs it most.

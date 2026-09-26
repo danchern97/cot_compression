@@ -34,6 +34,7 @@ from cot_compression.compression import (
     RandomCompressionMethod,
     SignalWeightedMeanCompressionMethod,
     SimpleMeanCompressionMethod,
+    StepMeanCompressionMethod,
 )
 from cot_compression.data.chat import IGNORE_INDEX
 from cot_compression.patching import PatchingMethod
@@ -53,6 +54,10 @@ def build_latent_init(name: str, patching: PatchingMethod | None) -> Compression
         return RandomCompressionMethod(patching)
     if name == "simple_mean":
         return SimpleMeanCompressionMethod(patching)
+    if name == "step_mean":
+        # The same arithmetic mean the training seed computes, so a step checkpoint
+        # is scored from the initialization it was trained from.
+        return StepMeanCompressionMethod(patching)
     if name in ("surprisal_t0", "entropy_t0"):
         # T=0 collapses the softmax to a one-hot on the highest-signal token, i.e.
         # the single most surprising (or most uncertain) token's embedding stands
@@ -65,7 +70,7 @@ def build_latent_init(name: str, patching: PatchingMethod | None) -> Compression
         )
     raise ValueError(
         f"Unknown latent_init {name!r}; expected random, simple_mean, "
-        "surprisal_t0 or entropy_t0."
+        "step_mean, surprisal_t0 or entropy_t0."
     )
 
 

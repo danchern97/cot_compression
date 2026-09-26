@@ -1,0 +1,41 @@
+# The step arm: `\n\n` paragraphs instead of token patches, and no quantizer.
+#
+# Why: at ratio 4 the token-level patching this inherits produces a median patch of
+# 2 tokens and 39.5% single-token patches, and its boundaries are near-orthogonal to
+# reasoning structure -- the standalone `\n\n` token has mean surprisal 0.000 and is
+# never patch-initial (reports/cot-patch-inspector.html). A code summarizing two
+# arbitrary tokens has no coherent thing to mean. Paragraphs are the unit
+# arXiv:2508.03346 uses, and they are model-free: no signal cache, no precompute.
+#
+# Measured on 1,500 real val traces: 144.5 steps/trace (median 45, max 1,072), step
+# length mean 39.2 tokens (median 24, max 3,518), and only 1.9% of traces contain no
+# `\n\n` at all -- those become a single step, i.e. exactly uniform patching.
+defaults:
+  - baseline
+  - _self_
+
+# Steps, with `max(1, round(len / compression_ratio))` latents each. `round`, not
+# `ceil`: realized ratio 3.99 vs 3.85 at r=4, and 15.08 vs 13.37 at r=16, where
+# `ceil` also inflates K and the [B, 1, K, M] cross mask by ~20%. At r=4 the step
+# arm's K is within 0.17% of uniform's, so the two stay comparable.
+patching: paragraph
+
+# The point of this arm: rule the quantizer out as the bottleneck before tuning it.
+use_vq: false
+
+# Mean of the step's input embeddings, shared by that step's latents. Needs the
+# embedding table, so a worker ships the bag partition and the main process does one
+# `embedding_bag` -- pooling per STEP, not per latent, which is what keeps the flat
+# id list at the CoT length instead of 880 x 3,518 for the longest real step.
+#
+# Consequence worth watching: a step's latents therefore START identical, and with
+# `query_anchor: step` they also share a cross-attention query position, so only the
+# causal self-attention over slots separates them. `enc/within_step_cos` is the
+# metric that says whether that was enough.
+latent_init: step_mean
+
+# `random` is the floor; `step_mean` is this arm's own initialization spliced in
+# with no encoder, so it asks whether training beat the seed it started from -- the
+# role `surprisal_t0` plays for the baseline. That one needs the surprisal cache,
+# which this arm never builds.
+eval_controls: [random, step_mean]

@@ -1,4 +1,11 @@
-"""Auxiliary next-patch supervision: predict patch j+1 from codes 0..j.
+"""Auxiliary next-unit supervision: predict unit j+1 from the codes before it.
+
+A *unit* is whatever the patching strategy groups tokens into: a token patch under
+`uniform`, a `\n\n` reasoning step under `paragraph`. The mechanism is identical
+either way -- predict a unit from the code that precedes it -- so the names here
+stay "patch". What changes with steps is only WHICH code precedes a unit: with one
+latent per patch it is `z_{m-1}`, but a step holds several latents and the
+conditioning one is the LAST latent of step m-1, supplied as `cond_slot`.
 
 The objective is: from ``[prompt; z_0..z_j]``, predict the tokens of patch *j+1*,
 teacher-forced, through the **frozen** decoder, with ordinary cross-entropy. It
@@ -100,6 +107,7 @@ def build_next_patch_batch(
     aux_ids: Tensor,
     aux_patch: Tensor,
     prefix_len: Tensor,
+    cond_slot: Tensor | None = None,
     width: int | None = None,
 ) -> NextPatchBatch:
     """Lay out every row's aux tokens after its own prefix and pair them with targets.
@@ -127,8 +135,13 @@ def build_next_patch_batch(
     index = torch.arange(span, device=device)
     columns = prefix_len.unsqueeze(1) + index  # [B, A]; only meaningful where valid
 
-    # The code each aux token is conditioned on: patch m reads z_{m-1}.
-    limit = torch.gather(slot_positions, 1, (aux_patch - 1).clamp_min(0))
+    # The code each aux token is conditioned on. Two gathers rather than one: the
+    # first maps unit -> conditioning slot, the second slot -> its Pass B column.
+    # Both are over [B, A] and neither syncs; folding them into a precomputed
+    # per-unit column would change the signature for every existing caller.
+    unit = aux_patch.clamp_min(0)
+    slot = unit - 1 if cond_slot is None else torch.gather(cond_slot, 1, unit)
+    limit = torch.gather(slot_positions, 1, slot.clamp_min(0))
 
     # A change of patch index along the row marks a patch's first token.
     previous = torch.cat(
@@ -166,20 +179,21 @@ def build_next_patch_batch(
 
 
 def patch_weights(aux_patch: Tensor) -> tuple[Tensor, Tensor]:
-    """Per-target weights `1/(P_i * T_ij)`, and each row's supervised-patch count.
+    """Per-target weights `1/(P_i * T_ij)`, and each row's supervised-unit count.
 
-    The objective averages CE **within a patch**, then **over a row's patches**, then
+    The objective averages CE **within a unit**, then **over a row's units**, then
     over rows, so a target's weight is the product of those two reciprocals and every
-    row's weights sum to 1. `T_ij` is patch *j*'s token count, `P_i` the number of
-    supervised patches in row *i* (patch 0 never appears, and `next_patch_subsample`
-    may drop others).
+    row's weights sum to 1. `T_ij` is unit *j*'s token count, `P_i` the number of
+    supervised units in row *i* (unit 0 never appears, and `next_patch_subsample`
+    may drop others). A unit is a token patch or a `\n\n` step depending on the
+    patching; this function cannot tell and does not need to.
 
     Returned in `aux_patch[valid]` order, which is exactly `targets` order, so the
     weights line up with the CE terms positionally and need no second gather.
 
-    Keyed by *run*, not by patch index: `aux_patch` is non-decreasing along a row, so
-    a cumulative sum over "this is a new patch" gives every (row, patch) pair a dense
-    id. Keying on the patch index instead would need `aux_patch.max()` -- a host sync
+    Keyed by *run*, not by unit index: `aux_patch` is non-decreasing along a row, so
+    a cumulative sum over "this is a new unit" gives every (row, unit) pair a dense
+    id. Keying on the unit index instead would need `aux_patch.max()` -- a host sync
     per micro-batch -- because a subsampled row's indices are sparse (K can be 8,000
     with 40 surviving tokens).
     """
@@ -217,6 +231,13 @@ def next_patch_mask_mod(batch: NextPatchBatch) -> Any:
     `q == kv` is always allowed. A fully masked row yields NaN from the softmax, and
     one NaN poisons the whole batch's gradient even where the loss ignores it -- the
     same guard `CoTEncoder._cross_mask` applies with `allowed[..., 0] = True`.
+
+    Unchanged by step segmentation, and the no-leak argument stays tight under it:
+    a step-m token sees the prefix through the last latent of step m-1, and the most
+    any of those latents ever read is `end(step m-1)`, their own `cross_limit`. So
+    nothing reachable from step m's tokens has seen step m's raw text. `aux_to_aux`
+    just grows from a ~4x4 block to a ~40x40 one, which is teacher forcing inside a
+    step and is negligible beside `aux_to_prefix`.
     """
     is_prefix, patch, code_limit = batch.is_prefix, batch.patch, batch.code_limit
 

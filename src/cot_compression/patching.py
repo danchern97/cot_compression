@@ -1,11 +1,49 @@
+"""Where patch boundaries fall: token-level rules, and paragraph steps.
+
+Every strategy returns the *latent sub-spans* -- the partition each code
+summarizes -- so pooling, initialization and the aux targets are correct whatever
+chose the boundaries. Strategies that also carry a coarser grouping (today only
+`paragraph`) expose it through `layout`, whose default wraps `split` as one step
+per span; see `cot_compression.steps`.
+"""
+
 from __future__ import annotations
 
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
 from cot_compression.signals import SIGNALS
+from cot_compression.steps import (
+    StepLayout,
+    segment_paragraph_steps,
+    trivial_step_layout,
+)
+
+
+@dataclass(frozen=True)
+class SplitContext:
+    """Per-sample material a text-aware strategy needs beyond the token count.
+
+    `split` otherwise sees only `num_tokens` and an optional per-token signal
+    tensor, and neither can carry text. Widening `SIGNALS` instead would mint an
+    npz cache stem and a GPU precompute pass for something that needs no forward
+    pass at all, so this is a third channel rather than a fourth signal.
+
+    Two callers hold different things. Training prep has the raw trace and can
+    tokenize it with offsets. Evaluation plans K in a DataLoader worker but calls
+    `materialize` later from the main process, which no longer has the text -- so
+    the worker resolves the layout once and ships it, and `layout` wins over
+    `text`/`offsets` when both are present. That makes a worker/main disagreement
+    on K impossible rather than merely unlikely, which matters because
+    `evaluate_method` silently drops a sample whose counts disagree.
+    """
+
+    text: str | None = None
+    offsets: Sequence[tuple[int, int]] | None = None
+    layout: StepLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -18,6 +56,16 @@ class PatchingMethod:
     """
 
     name: str
+
+    def requires_context(self) -> bool:
+        """Whether `split`/`layout` need a `SplitContext`.
+
+        Mirrors `required_signal()`: the caller asks before doing the extra work,
+        because a context needs the CoT tokenized with an offsets mapping, which is
+        ~24% slower than the plain tokenization and only paragraph segmentation
+        uses.
+        """
+        return False
 
     def required_signal(self) -> str | None:
         """Which per-token signal split() needs, or None if it needs none.
@@ -39,8 +87,29 @@ class PatchingMethod:
         sample_index: int,
         seed: int,
         values: torch.Tensor | None,
+        *,
+        context: SplitContext | None = None,
     ) -> list[tuple[int, int]]:
         raise NotImplementedError
+
+    def layout(
+        self,
+        num_tokens: int,
+        sample_index: int,
+        seed: int,
+        values: torch.Tensor | None,
+        *,
+        context: SplitContext | None = None,
+    ) -> StepLayout:
+        """The two-level segmentation: steps, and the latents inside them.
+
+        Defaults to one step per span, which is what token patching means in step
+        vocabulary. That degeneracy is load-bearing: it lets the encoder run a
+        single branch-free code path whose `cross_limit` and `cond_slot` reduce to
+        their pre-existing values under `uniform`.
+        """
+        spans = self.split(num_tokens, sample_index, seed, values, context=context)
+        return trivial_step_layout(spans)
 
 
 @dataclass(frozen=True)
@@ -74,8 +143,10 @@ class UniformPatchingMethod(PatchingMethod):
         sample_index: int,
         seed: int,
         values: torch.Tensor | None,
+        *,
+        context: SplitContext | None = None,
     ) -> list[tuple[int, int]]:
-        del sample_index, seed, values
+        del sample_index, seed, values, context
         return [
             (start, min(start + self.patch_size, num_tokens))
             for start in range(0, num_tokens, self.patch_size)
@@ -104,8 +175,10 @@ class RandomPatchingMethod(PatchingMethod):
         sample_index: int,
         seed: int,
         values: torch.Tensor | None,
+        *,
+        context: SplitContext | None = None,
     ) -> list[tuple[int, int]]:
-        del values
+        del values, context
         rng = random.Random(seed + sample_index)
         spans = []
         start = 0
@@ -172,8 +245,10 @@ class SignalThresholdPatchingMethod(SignalPatchingMethod):
         sample_index: int,
         seed: int,
         values: torch.Tensor | None,
+        *,
+        context: SplitContext | None = None,
     ) -> list[tuple[int, int]]:
-        del sample_index, seed
+        del sample_index, seed, context
         assert values is not None
         # torch.quantile does not support bfloat16 (the model's usual dtype).
         quantile = 1.0 - 1.0 / self.compression_ratio
@@ -207,8 +282,10 @@ class SignalDiffPatchingMethod(SignalPatchingMethod):
         sample_index: int,
         seed: int,
         values: torch.Tensor | None,
+        *,
+        context: SplitContext | None = None,
     ) -> list[tuple[int, int]]:
-        del sample_index, seed
+        del sample_index, seed, context
         assert values is not None
         if num_tokens <= 1:
             return [(0, num_tokens)]
@@ -244,8 +321,10 @@ class SignalSumPatchingMethod(SignalPatchingMethod):
         sample_index: int,
         seed: int,
         values: torch.Tensor | None,
+        *,
+        context: SplitContext | None = None,
     ) -> list[tuple[int, int]]:
-        del sample_index, seed
+        del sample_index, seed, context
         assert values is not None
         if num_tokens <= 1:
             return [(0, num_tokens)]
@@ -270,3 +349,86 @@ class SignalSumPatchingMethod(SignalPatchingMethod):
         starts = torch.unique(raw.clamp(1, num_tokens - 1))
         boundaries = [0] + starts.tolist() + [num_tokens]
         return list(zip(boundaries[:-1], boundaries[1:], strict=True))
+
+
+@dataclass(frozen=True)
+class ParagraphStepPatchingMethod(PatchingMethod):
+    """Steps are `\\n\\n` paragraphs; each gets `max(1, round(len / ratio))` latents.
+
+    The segmentation of arXiv:2508.03346, which splits the thinking content on
+    `\\n\\n`. Unlike every other strategy here it is content-defined without being
+    *signal*-defined: it needs no forward pass, no cache, and no GPU, only the
+    trace text and its token offsets. Boundaries are therefore exactly
+    reproducible between a DataLoader worker and the main process, which is why
+    `required_signal()` stays None and `signal_span_counts` is correctly bypassed.
+
+    `split` returns the latent sub-spans so that pooling and per-slot
+    initialization behave as they do for any other strategy; `layout` adds the
+    step grouping the encoder needs for its cross-attention bound and its
+    next-step targets.
+    """
+
+    compression_ratio: float
+
+    def __init__(self, compression_ratio: float = 4.0) -> None:
+        if compression_ratio < 1.0:
+            raise ValueError("compression_ratio must be >= 1.")
+        super().__init__(name="paragraph")
+        object.__setattr__(self, "compression_ratio", float(compression_ratio))
+
+    @property
+    def param_tag(self) -> str:
+        return f"cr{self.compression_ratio:g}"
+
+    def requires_context(self) -> bool:
+        return True
+
+    def layout(
+        self,
+        num_tokens: int,
+        sample_index: int,
+        seed: int,
+        values: torch.Tensor | None,
+        *,
+        context: SplitContext | None = None,
+    ) -> StepLayout:
+        del sample_index, seed, values
+        # RuntimeError, not ValueError, for both wiring failures below: the eval loop
+        # reads a ValueError out of `materialize` as "this sample lacks data" and
+        # counts a skip, so a caller that forgot the context would silently score
+        # nothing instead of failing. A context is always constructible from the
+        # trace, so its absence is a bug in the caller, never a property of the data.
+        if context is None:
+            raise RuntimeError(
+                "paragraph patching needs a SplitContext carrying either the trace "
+                "text and its token offsets, or a pre-resolved StepLayout. Callers "
+                "learn this from `requires_context()`."
+            )
+        if context.layout is not None:
+            resolved = context.layout
+        elif context.text is not None and context.offsets is not None:
+            resolved = segment_paragraph_steps(
+                context.text, context.offsets, self.compression_ratio
+            )
+        else:
+            raise RuntimeError(
+                "SplitContext must carry `layout`, or both `text` and `offsets`."
+            )
+        # Cheap, and it is the only thing standing between a malformed layout and a
+        # silent misalignment on the device, where `cross_limit`/`cond_slot` are
+        # consumed by `gather` with no bounds check.
+        resolved.validate(num_tokens)
+        return resolved
+
+    def split(
+        self,
+        num_tokens: int,
+        sample_index: int,
+        seed: int,
+        values: torch.Tensor | None,
+        *,
+        context: SplitContext | None = None,
+    ) -> list[tuple[int, int]]:
+        return list(
+            self.layout(num_tokens, sample_index, seed, values, context=context).latents
+        )

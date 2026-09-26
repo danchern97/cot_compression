@@ -70,6 +70,30 @@ memory_layer: -1
 # no precompute; the signal strategies need one and are not wired yet.
 patching: uniform
 
+# Discretization on/off. false trains the encoder's output continuously (z = g),
+# with no codebook parameter constructed at all -- which is how you find out whether
+# VQ is what limits the codes, or the architecture is. Everything below this line is
+# inert when it is false.
+#
+# Keep in mind when reading such a run: a free 1024-dim vector per latent can carry
+# most of a step, so the only bottleneck left is sequence length. A good continuous
+# result is an upper bound and a sanity check, not evidence the discrete version
+# will reach it.
+use_vq: true
+
+# Where a latent's CROSS-ATTENTION RoPE query sits. Only matters when several
+# latents share one step, which is a `paragraph` thing:
+#   step     the step's last token, shared by the step's latents. The plain reading
+#            of "cross-attend up to the current step", and identical to the historical
+#            behaviour wherever one span is one slot.
+#   substep  each latent's own even sub-span end, so anchors differ within a step.
+#            The MASK is unchanged either way -- every latent still sees the whole
+#            step -- so this is a positional hint, not a re-segmentation. It carries a
+#            uniform-coverage prior and makes relative offsets mixed-sign, which is
+#            why it is off: reach for it if `enc/within_step_cos` says the latents of
+#            a step have collapsed onto each other.
+query_anchor: step
+
 # VQ. Gradient-trained codebook (not EMA), so it is a plain nn.Parameter that DDP
 # all-reduces like any other weight.
 #

@@ -75,6 +75,27 @@ def cot_token_ids(trace: AnswerTrace, tokenizer: Any) -> list[int]:
     return list(cot_ids)
 
 
+def cot_token_ids_and_offsets(
+    trace: AnswerTrace, tokenizer: Any
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """``cot_token_ids`` plus each token's character span in ``trace.trace``.
+
+    A separate function rather than a flag on `cot_token_ids`, because offsets cost
+    ~24% on this call (12.2 -> 15.2 ms/row measured) and only paragraph
+    segmentation needs them -- `_measure_row`, which runs over the whole corpus,
+    must not pay it. The offsets index into `trace.trace` directly, since that is
+    what is tokenized; no chat template is involved.
+    """
+    encoded = tokenizer(
+        trace.trace, add_special_tokens=False, return_offsets_mapping=True
+    )
+    cot_ids = encoded["input_ids"]
+    if not cot_ids:
+        raise ValueError("CoT trace produced no tokens.")
+    offsets = [(int(start), int(end)) for start, end in encoded["offset_mapping"]]
+    return list(cot_ids), offsets
+
+
 def prefix_token_ids(trace: AnswerTrace, tokenizer: Any) -> list[int]:
     """Tokenize everything preceding the CoT trace in the rendered chat.
 

@@ -554,3 +554,142 @@ def test_rope_changes_the_encoding():
             latent, memory, slot_mask, memory_mask, cross_limit=cross_limit
         )
     assert not torch.allclose(without, with_rope, atol=1e-4)
+
+
+# --------------------------------------------------------------------------- #
+# Step segmentation: the query anchor, and running without a codebook
+# --------------------------------------------------------------------------- #
+
+
+def _step_config(**overrides) -> EncoderConfig:
+    base = dict(d_llm=16, n_blocks=1, n_heads=2, ffn_mult=2, codebook_size=4)
+    return EncoderConfig(**{**base, **overrides})
+
+
+def test_query_limit_defaults_to_cross_limit() -> None:
+    """Absent, the anchor is where it has always been; present, it replaces it."""
+    encoder = CoTEncoder(_step_config(position_encoding="rope"))
+    cross_limit = torch.tensor([[3, 6, 9]])
+    query_limit = torch.tensor([[2, 4, 8]])
+
+    _, default_anchor, _ = encoder.rope_positions(3, 12, cross_limit, None)
+    _, explicit, _ = encoder.rope_positions(3, 12, cross_limit, query_limit)
+    assert default_anchor.tolist() == [[2, 5, 8]]
+    assert explicit.tolist() == [[1, 3, 7]]
+    # Passing cross_limit back in as the anchor must be indistinguishable from None,
+    # which is what makes the `uniform` arm bit-identical to before.
+    _, echoed, _ = encoder.rope_positions(3, 12, cross_limit, cross_limit)
+    assert torch.equal(echoed, default_anchor)
+
+
+def test_a_shared_cross_limit_collapses_the_anchor_without_query_limit() -> None:
+    """The isolated statement of the bug `query_limit` exists to prevent.
+
+    Step-scoping `cross_limit` gives every latent of a step one visibility bound --
+    which is the point -- but `cross_limit - 1` is ALSO the cross-attention query
+    position, so without a separate anchor those latents become positionally
+    indistinguishable. A real trace reaches 880 latents in one step.
+    """
+    encoder = CoTEncoder(_step_config(position_encoding="rope"))
+    # Three latents in a step ending at 6, then two in a step ending at 10.
+    cross_limit = torch.tensor([[6, 6, 6, 10, 10]])
+    substep = torch.tensor([[2, 4, 6, 8, 10]])
+
+    _, shared, _ = encoder.rope_positions(5, 12, cross_limit, None)
+    assert shared.tolist() == [[5, 5, 5, 9, 9]], "all latents of a step share one"
+    _, distinct, _ = encoder.rope_positions(5, 12, cross_limit, substep)
+    assert distinct.tolist() == [[1, 3, 5, 7, 9]]
+    assert (distinct[0, 1:] > distinct[0, :-1]).all(), "strictly increasing"
+    # The last latent of a step anchors exactly where the shared anchor is, since its
+    # sub-span ends at the step end.
+    assert distinct[0, 2] == shared[0, 2] and distinct[0, 4] == shared[0, 4]
+
+
+def test_step_scoped_cross_mask_shows_every_latent_its_whole_step() -> None:
+    """Spec item 3: cross-attend the CoT up to and including the current step."""
+    encoder = CoTEncoder(_step_config(cross_attn_mask="causal"))
+    slot_mask = torch.ones(1, 5, dtype=torch.bool)
+    memory_mask = torch.ones(1, 12, dtype=torch.bool)
+    mask = encoder._cross_mask(
+        slot_mask, memory_mask, torch.tensor([[6, 6, 6, 10, 10]])
+    )
+
+    for slot in (0, 1, 2):
+        assert mask[0, 0, slot].nonzero().flatten().tolist() == list(range(6))
+    for slot in (3, 4):
+        assert mask[0, 0, slot].nonzero().flatten().tolist() == list(range(10))
+
+
+def test_query_limit_changes_the_encoding() -> None:
+    """A different anchor must actually reach the attention, not be dropped."""
+    torch.manual_seed(0)
+    encoder = CoTEncoder(_step_config(position_encoding="rope"))
+    latent = torch.randn(1, 5, 16)
+    memory = torch.randn(1, 12, 16)
+    slot_mask = torch.ones(1, 5, dtype=torch.bool)
+    memory_mask = torch.ones(1, 12, dtype=torch.bool)
+    cross_limit = torch.tensor([[6, 6, 6, 10, 10]])
+
+    with torch.no_grad():
+        shared = encoder.encode(latent, memory, slot_mask, memory_mask, cross_limit)
+        substep = encoder.encode(
+            latent,
+            memory,
+            slot_mask,
+            memory_mask,
+            cross_limit,
+            torch.tensor([[2, 4, 6, 8, 10]]),
+        )
+        echoed = encoder.encode(
+            latent, memory, slot_mask, memory_mask, cross_limit, cross_limit
+        )
+    assert not torch.allclose(shared, substep, atol=1e-5)
+    # Passing the same values as `cross_limit` must be exactly the default path.
+    assert torch.equal(shared, echoed)
+
+
+def test_continuous_encoder_has_no_codebook() -> None:
+    """`use_vq=False` must not merely bypass the quantizer -- it must not build one.
+
+    A constructed-but-ungradiented `nn.Parameter` raises under DDP's
+    `find_unused_parameters=False`, which is what `train_encoder` uses, and would
+    leave dead `quantizer.*` keys in every checkpoint.
+    """
+    encoder = CoTEncoder(_step_config(use_vq=False))
+    assert encoder.quantizer is None
+    assert not [k for k in encoder.state_dict() if k.startswith("quantizer")]
+
+    latent = torch.randn(2, 3, 16)
+    memory = torch.randn(2, 7, 16)
+    slot_mask = torch.ones(2, 3, dtype=torch.bool)
+    memory_mask = torch.ones(2, 7, dtype=torch.bool)
+    out = encoder(latent, memory, slot_mask, memory_mask, torch.tensor([[7] * 3] * 2))
+
+    hidden = encoder.encode(
+        latent, memory, slot_mask, memory_mask, torch.tensor([[7] * 3] * 2)
+    )
+    # Bitwise, not approximately: `z` IS the encoder output, with no straight-through
+    # estimator in between.
+    assert torch.equal(out.z, hidden)
+    assert float(out.codebook_loss) == 0.0 and float(out.commit_loss) == 0.0
+    assert out.counts.numel() == 0
+
+    out.z.sum().backward()
+    missing = [n for n, p in encoder.named_parameters() if p.grad is None]
+    assert missing == [], missing
+
+
+def test_a_vq_checkpoint_does_not_load_into_a_continuous_encoder() -> None:
+    """The failure `check_encoder_architecture` pre-empts by comparing `use_vq`."""
+    quantized = CoTEncoder(_step_config(use_vq=True))
+    continuous = CoTEncoder(_step_config(use_vq=False))
+    with pytest.raises(RuntimeError, match="quantizer"):
+        continuous.load_state_dict(quantized.state_dict())
+
+
+def test_use_vq_is_validated_and_defaults_on() -> None:
+    """Default True, so a manifest predating the field reads as the encoder it was."""
+    assert EncoderConfig(d_llm=16).use_vq is True
+    assert EncoderConfig(d_llm=16).query_anchor == "step"
+    with pytest.raises(ValueError, match="query_anchor"):
+        EncoderConfig(d_llm=16, query_anchor="middle")

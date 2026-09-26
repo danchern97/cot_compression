@@ -1,0 +1,62 @@
+# @package _global_
+#
+# Train the step-segmented, un-quantized compressor against a frozen Qwen3-0.6B.
+#
+# A separate workflow rather than overrides on encoder_train.yaml, for the reason
+# that file documents at length: run_name is both the run directory and the W&B run
+# id, so two campaigns sharing a run_tag resolve onto one directory and
+# `resume_from_checkpoint=auto` loads the other's weights. A distinct run_tag makes
+# that unreachable by forgetting a flag; check_encoder_architecture -- which now
+# compares `use_vq` and `query_anchor` too -- is the second line of defence.
+
+defaults:
+  - /paths: default
+  - /data: dolci_compression_traces
+  - /method: qwen3/0_6b
+  - /encoder: step
+  - /training: encoder
+  - /evaluation: answer_loss
+  - /optim: adamw
+  - /logging: wandb
+  - _self_
+
+mode: encoder_train
+
+optim:
+  lr: 0.0003
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1e-8
+
+evaluation:
+  methods:
+    patching:
+      compression_ratio: 4.0
+
+logging:
+  group: encoder
+  name: ${run_name}
+  tags:
+    - encoder
+    - step
+    - continuous
+    - qwen3-0.6b
+
+run_tag: enc-step-qwen3-0.6b
+# Every axis that changes what is being trained. `codebook_size` is deliberately
+# absent: there is no codebook under use_vq=false, so including it would fork the
+# run directory on a field that does nothing.
+run_name: ${run_tag}_cr${evaluation.methods.patching.compression_ratio}_${encoder.patching}_vq${encoder.use_vq}_${encoder.latent_init}_qa${encoder.query_anchor}_${encoder.self_attn_mask}-${encoder.cross_attn_mask}_pe${encoder.position_encoding}_np${encoder.next_patch_weight}_lr${optim.lr}
+
+paths:
+  run_dir: ${paths.output_dir}/runs/encoder/${data.name}/${run_name}
+
+hydra:
+  run:
+    dir: ${paths.run_dir}
+  sweep:
+    dir: ${paths.run_dir}
+    subdir: .
+  job:
+    chdir: false

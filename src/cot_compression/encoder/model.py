@@ -29,10 +29,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 MaskMode = Literal["causal", "bidirectional"]
-LatentInit = Literal["random", "simple_mean", "surprisal_t0", "entropy_t0"]
+LatentInit = Literal["random", "simple_mean", "step_mean", "surprisal_t0", "entropy_t0"]
 LATENT_INITS: tuple[str, ...] = get_args(LatentInit)
 PositionEncoding = Literal["none", "rope"]
 POSITION_ENCODINGS: tuple[str, ...] = get_args(PositionEncoding)
+QueryAnchor = Literal["step", "substep"]
+QUERY_ANCHORS: tuple[str, ...] = get_args(QueryAnchor)
 
 
 @dataclass(frozen=True)
@@ -72,10 +74,28 @@ class EncoderConfig:
     # head_dim 128, which is exactly this encoder's head dim at d_llm=1024, n_heads=8
     # -- and `max_length` is 32,768, so the memory really does reach that far.
     rope_theta: float = 1_000_000.0
+    # Where a latent's CROSS-ATTENTION RoPE query sits. "step" leaves it at
+    # `cross_limit - 1`, so a step's latents share one anchor -- the historical
+    # behaviour, and identical to it whenever one span is one slot. "substep" gives
+    # each latent its own sub-span end, which separates latents that would otherwise
+    # be positionally identical, at the cost of a uniform-coverage prior and
+    # mixed-sign relative offsets. Recorded here, not just in the prep config, so a
+    # checkpoint is scored with the anchors it trained under.
+    query_anchor: QueryAnchor = "step"
     # Softens `argmin` into a weighted average of codes early in training; 0.0
     # disables it. Off by default -- an early-collapse mitigation to reach for
     # only once utilization is measured to be failing.
     soft_assign_temperature: float = 0.0
+    # Discretization on/off. True keeps the quantized baseline; False trains the
+    # encoder output continuously (`z = g`) with no codebook parameter at all, to
+    # establish whether VQ is what limits the codes rather than the architecture.
+    #
+    # Defaults True so a manifest written before this field existed reads as the VQ
+    # encoder it actually is -- the same reasoning as `position_encoding="none"`.
+    # `out_norm` matters MORE without VQ, not less: with `z = g` spliced straight
+    # into `inputs_embeds`, its `embed_rms` init is the only thing setting the scale
+    # the frozen decoder sees.
+    use_vq: bool = True
     commit_weight: float = 0.25
     # Weight on the auxiliary next-patch loss, now a ratio between two comparable
     # per-row means: a row's mean per-patch CE against its mean answer CE. It no
@@ -113,6 +133,11 @@ class EncoderConfig:
         if self.latent_init not in LATENT_INITS:
             raise ValueError(
                 f"latent_init must be one of {LATENT_INITS}, got {self.latent_init!r}."
+            )
+        if self.query_anchor not in QUERY_ANCHORS:
+            raise ValueError(
+                f"query_anchor must be one of {QUERY_ANCHORS}, got "
+                f"{self.query_anchor!r}."
             )
         if self.position_encoding not in POSITION_ENCODINGS:
             raise ValueError(
@@ -391,6 +416,30 @@ class VectorQuantizer(nn.Module):
         )
 
 
+def identity_quantizer_output(hidden: Tensor, slot_mask: Tensor) -> QuantizerOutput:
+    """The `use_vq=False` path: pass the encoder output through untouched.
+
+    `z = hidden` with no straight-through estimator, because there is nothing to
+    estimate around -- the gradient to the encoder is direct. Both quantizer terms
+    are exact zeros rather than omitted, so the loss vector keeps one shape across
+    arms and `TOTALS` keeps one width for the all-reduce; `pop_totals` is what
+    drops them from the *report*.
+
+    `counts` is empty rather than zeros: nothing should be folding codebook usage
+    into an EMA when there is no codebook, and an empty tensor makes that a loud
+    failure instead of a silent no-op.
+    """
+    zero = hidden.new_zeros((), dtype=torch.float32)
+    return QuantizerOutput(
+        z=hidden,
+        codebook_loss=zero,
+        commit_loss=zero,
+        indices=torch.zeros_like(slot_mask, dtype=torch.long),
+        counts=torch.zeros(0, dtype=torch.long, device=hidden.device),
+        encoder_output=hidden.detach(),
+    )
+
+
 RopeTables = tuple[Tensor, Tensor]
 
 
@@ -536,7 +585,10 @@ class CoTEncoder(nn.Module):
         # sets the scale of every code spliced into the frozen decoder. See
         # `EncoderConfig.embed_rms`. Learnable, so the model can still move it.
         nn.init.constant_(self.out_norm.weight, config.embed_rms)
-        self.quantizer = VectorQuantizer(config)
+        # NOT constructed when off. A built-but-ungradiented `nn.Parameter` raises
+        # under DDP's `find_unused_parameters=False`, which `train_encoder` uses,
+        # and it would put dead `quantizer.*` keys in every checkpoint.
+        self.quantizer = VectorQuantizer(config) if config.use_vq else None
 
     def forward(
         self,
@@ -545,6 +597,7 @@ class CoTEncoder(nn.Module):
         slot_mask: Tensor,
         memory_mask: Tensor,
         cross_limit: Tensor | None = None,
+        query_limit: Tensor | None = None,
     ) -> QuantizerOutput:
         """
         ``latent_init``  [B, K, d]  seed per slot; a constant, never a parameter.
@@ -555,6 +608,10 @@ class CoTEncoder(nn.Module):
                                     slot may attend to; required when
                                     ``cross_attn_mask == "causal"``, ignored
                                     otherwise.
+        ``query_limit``  [B, K]     optional; overrides where each slot's
+                                    cross-attention RoPE query sits. ``None`` means
+                                    ``cross_limit``, which is the historical
+                                    behaviour. See ``rope_positions``.
         """
         # The decoder runs in bf16 while these parameters are fp32 masters, so the
         # inputs arrive in the decoder's dtype. `encode` casts at the boundary
@@ -562,10 +619,12 @@ class CoTEncoder(nn.Module):
         # correct inside a context manager is one that will eventually be called
         # outside one. Under autocast this is harmless -- autocast still picks the
         # matmul dtype.
-        return self.quantizer(
-            self.encode(latent_init, memory, slot_mask, memory_mask, cross_limit),
-            slot_mask,
+        hidden = self.encode(
+            latent_init, memory, slot_mask, memory_mask, cross_limit, query_limit
         )
+        if self.quantizer is None:
+            return identity_quantizer_output(hidden, slot_mask)
+        return self.quantizer(hidden, slot_mask)
 
     def encode(
         self,
@@ -574,6 +633,7 @@ class CoTEncoder(nn.Module):
         slot_mask: Tensor,
         memory_mask: Tensor,
         cross_limit: Tensor | None = None,
+        query_limit: Tensor | None = None,
     ) -> Tensor:
         """Everything up to and including `out_norm`, without quantizing.
 
@@ -586,7 +646,7 @@ class CoTEncoder(nn.Module):
         hidden = latent_init.to(dtype)
         memory = memory.to(dtype)
         slot_rope, span_rope, memory_rope = self._rope(
-            slot_mask.shape[1], memory.shape[1], cross_limit
+            slot_mask.shape[1], memory.shape[1], cross_limit, query_limit
         )
         for block in self.blocks:
             hidden = block(
@@ -595,7 +655,11 @@ class CoTEncoder(nn.Module):
         return self.out_norm(hidden)
 
     def rope_positions(
-        self, slots: int, length: int, cross_limit: Tensor | None
+        self,
+        slots: int,
+        length: int,
+        cross_limit: Tensor | None,
+        query_limit: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """The three position arrays: `(slot index, span end, memory index)`.
 
@@ -630,12 +694,23 @@ class CoTEncoder(nn.Module):
         device = cross_limit.device
         slot_positions = torch.arange(slots, device=device).unsqueeze(0)
         memory_positions = torch.arange(length, device=device).unsqueeze(0)
-        # Padded slots carry cross_limit=1 (collate keeps their attention row
-        # non-empty), so this is 0 for them. Their output is discarded anyway.
-        return slot_positions, (cross_limit - 1).clamp_min(0), memory_positions
+        # `cross_limit` does two jobs: it bounds VISIBILITY in `_cross_mask`, and
+        # by default it also places the query. Those coincide while one span is one
+        # slot, but step-scoped patching gives every latent of a step the same
+        # bound -- and would therefore silently give them all the same query
+        # position, leaving them separable only through the latent self-attention.
+        # `query_limit` splits the two apart; the mask never sees it.
+        anchor = cross_limit if query_limit is None else query_limit
+        # Padded slots carry limit=1 (collate keeps their attention row non-empty),
+        # so this is 0 for them. Their output is discarded anyway.
+        return slot_positions, (anchor - 1).clamp_min(0), memory_positions
 
     def _rope(
-        self, slots: int, length: int, cross_limit: Tensor | None
+        self,
+        slots: int,
+        length: int,
+        cross_limit: Tensor | None,
+        query_limit: Tensor | None = None,
     ) -> tuple[RopeTables | None, RopeTables | None, RopeTables | None]:
         """Tables for one forward, shared by every block. `None` when RoPE is off."""
         if self.config.position_encoding != "rope":
@@ -643,7 +718,7 @@ class CoTEncoder(nn.Module):
         head_dim = self.config.d_llm // self.config.n_heads
         theta = self.config.rope_theta
         slot_positions, span_positions, memory_positions = self.rope_positions(
-            slots, length, cross_limit
+            slots, length, cross_limit, query_limit
         )
         return (
             rope_tables(slot_positions, head_dim, theta),

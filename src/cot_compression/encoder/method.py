@@ -21,11 +21,11 @@ from cot_compression.compression import (
     EmbeddingCompressionMethod,
     _compose_name,
     _patching_values,
-    _split_spans,
+    _step_layout,
 )
 from cot_compression.encoder.frozen import build_latent_init
 from cot_compression.encoder.model import CoTEncoder
-from cot_compression.patching import PatchingMethod
+from cot_compression.patching import PatchingMethod, SplitContext
 
 
 @dataclass(frozen=True)
@@ -53,7 +53,14 @@ class LearnedCompressionMethod(EmbeddingCompressionMethod):
         latent_init: CompressionMethod,
     ) -> None:
         config = encoder.config
-        tag = f"enc_L{config.n_blocks}k{config.codebook_size}"
+        # `k{size}` names the codebook; without one there is no size to name, and
+        # reporting the dead field would make two different encoders share a join
+        # key. Byte-identical to before for every VQ checkpoint.
+        tag = (
+            f"enc_L{config.n_blocks}k{config.codebook_size}"
+            if config.use_vq
+            else f"enc_L{config.n_blocks}cont"
+        )
         # Appended only when set, so every method name written before positional
         # encodings existed stays byte-identical -- the name is the join key
         # between runs and every plot.
@@ -105,45 +112,83 @@ class LearnedCompressionMethod(EmbeddingCompressionMethod):
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
         prefix_ids: list[int] | None = None,
+        context: SplitContext | None = None,
     ) -> torch.Tensor | None:
         if prefix_ids is None:
             raise ValueError(
                 "LearnedCompressionMethod needs prefix_ids; requires_prefix() must "
                 "be honoured by the caller."
             )
+        # Refuse rather than fall back. Without the layout this would still produce
+        # a [K, d] matrix -- from the wrong K, and with every latent of a step
+        # anchored at the same position it never trained under -- i.e. a plausible
+        # number that is wrong. RuntimeError, not ValueError: `evaluate_method`
+        # counts a ValueError from `materialize` as a data skip, which would turn
+        # this wiring bug into a run that silently scores nothing.
+        if (
+            self.patching is not None
+            and self.patching.requires_context()
+            and context is None
+        ):
+            raise RuntimeError(
+                f"patching {self.patching.name!r} requires a SplitContext; the "
+                "eval worker must resolve the layout and pass it along."
+            )
         # Pass A. Deliberately NOT through FrozenBackbone: that constructor mutates
         # the model (freezing it, enabling gradient checkpointing), which is right
         # for training and pointless under no_grad where nothing is retained.
-        context = torch.tensor([prefix_ids + cot_ids], device=device)
+        context_ids = torch.tensor([prefix_ids + cot_ids], device=device)
         memory = model.model(
-            input_ids=context, attention_mask=torch.ones_like(context)
+            input_ids=context_ids, attention_mask=torch.ones_like(context_ids)
         ).last_hidden_state
 
         encoder, latent_init = self._parts()
+        # The context goes to the initializer too: it re-splits through
+        # `_split_spans`, and without it a paragraph-patched row would get a seed
+        # sized for uniform spans against a step-sized render.
         latent = latent_init.materialize(
-            cot_ids, sample_index, seed, tokenizer, model, device, cot_signals
+            cot_ids,
+            sample_index,
+            seed,
+            tokenizer,
+            model,
+            device,
+            cot_signals,
+            context=context,
         )
         if latent is None:
             return None
 
-        spans = _split_spans(
+        layout = _step_layout(
             self,
             len(cot_ids),
             _patching_values(self, cot_signals, device),
             sample_index,
             seed,
+            context,
         )
         prompt_len = len(prefix_ids)
+        # Step end, shared by a step's latents: each sees its whole step and nothing
+        # after it. Under one-latent-per-step patching this is the span end, as before.
         cross_limit = torch.tensor(
-            [[prompt_len + end for _, end in spans]], device=device
+            [[prompt_len + layout.steps[step][1] for step in layout.step_of_latent]],
+            device=device,
+        )
+        query_limit = (
+            torch.tensor(
+                [[prompt_len + end for _, end in layout.latents]], device=device
+            )
+            if encoder.config.query_anchor == "substep"
+            else None
         )
         slots = latent.shape[0]
         out = encoder(
             latent.unsqueeze(0).to(memory.dtype),
             memory,
             torch.ones(1, slots, dtype=torch.bool, device=device),
-            torch.ones(1, context.shape[1], dtype=torch.bool, device=device),
+            torch.ones(1, context_ids.shape[1], dtype=torch.bool, device=device),
             cross_limit=cross_limit,
+            query_limit=query_limit,
         )
         return out.z[0]
 

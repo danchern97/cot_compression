@@ -10,14 +10,17 @@ from omegaconf import DictConfig
 from cot_compression.data.answers import AnswerTrace, cot_token_ids, replace_trace
 from cot_compression.data.dolci import Message
 from cot_compression.patching import (
+    ParagraphStepPatchingMethod,
     PatchingMethod,
     RandomPatchingMethod,
     SignalDiffPatchingMethod,
     SignalSumPatchingMethod,
     SignalThresholdPatchingMethod,
+    SplitContext,
     UniformPatchingMethod,
 )
 from cot_compression.signals import SIGNALS
+from cot_compression.steps import StepLayout, trivial_step_layout
 
 # Reserved Qwen3 token used as the per-patch placeholder. Its embedding is
 # overwritten by the spliced slot vector at scoring time, so the token id is
@@ -110,6 +113,7 @@ class CompressionMethod:
         seed: int,
         cot_signals: dict[str, torch.Tensor | None] | None,
         device: torch.device,
+        context: SplitContext | None = None,
     ) -> CompressionPlan:
         """Decide the slot count and token accounting, without the model.
 
@@ -123,7 +127,7 @@ class CompressionMethod:
         # also needs a signal, but for pooling, which happens in materialize --
         # demanding it here would stop a worker planning a uniform-patched sample.
         values = _patching_values(self, cot_signals, device)
-        spans = _split_spans(self, num_cot_tokens, values, sample_index, seed)
+        spans = _split_spans(self, num_cot_tokens, values, sample_index, seed, context)
         return CompressionPlan(len(spans), num_cot_tokens, len(spans))
 
     def materialize(
@@ -136,6 +140,7 @@ class CompressionMethod:
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
         prefix_ids: list[int] | None = None,
+        context: SplitContext | None = None,
     ) -> torch.Tensor | None:
         """Build the [num_slots, hidden] slot matrix, or None for text methods.
 
@@ -155,6 +160,7 @@ class CompressionMethod:
         cot_signals: dict[str, torch.Tensor | None] | None,
         cot_ids: list[int] | None = None,
         prefix_ids: list[int] | None = None,
+        context: SplitContext | None = None,
     ) -> CompressionResult:
         """Compress ``trace``'s CoT: ``plan`` then ``materialize``, in one call.
 
@@ -164,7 +170,7 @@ class CompressionMethod:
         """
         if cot_ids is None:
             cot_ids = cot_token_ids(trace, tokenizer)
-        plan = self.plan(len(cot_ids), sample_index, seed, cot_signals, device)
+        plan = self.plan(len(cot_ids), sample_index, seed, cot_signals, device, context)
         slot_embeddings = self.materialize(
             cot_ids,
             sample_index,
@@ -174,6 +180,7 @@ class CompressionMethod:
             device,
             cot_signals,
             prefix_ids,
+            context,
         )
         return CompressionResult(
             messages=compressed_messages(trace, plan.num_slots),
@@ -227,11 +234,30 @@ def _split_spans(
     values: torch.Tensor | None,
     sample_index: int,
     seed: int,
+    context: SplitContext | None = None,
 ) -> list[tuple[int, int]]:
     """Partition the CoT, or return one span covering it when unpatched."""
     if method.patching is None:
         return [(0, num_cot_tokens)]
-    return method.patching.split(num_cot_tokens, sample_index, seed, values)
+    return method.patching.split(
+        num_cot_tokens, sample_index, seed, values, context=context
+    )
+
+
+def _step_layout(
+    method: CompressionMethod,
+    num_cot_tokens: int,
+    values: torch.Tensor | None,
+    sample_index: int,
+    seed: int,
+    context: SplitContext | None = None,
+) -> StepLayout:
+    """The two-level segmentation, with the unpatched case as one whole step."""
+    if method.patching is None:
+        return trivial_step_layout([(0, num_cot_tokens)])
+    return method.patching.layout(
+        num_cot_tokens, sample_index, seed, values, context=context
+    )
 
 
 def _reduce_spans_grouped(
@@ -302,8 +328,9 @@ class BaseCompressionMethod(CompressionMethod):
         seed: int,
         cot_signals: dict[str, torch.Tensor | None] | None,
         device: torch.device,
+        context: SplitContext | None = None,
     ) -> CompressionPlan:
-        del sample_index, seed, cot_signals, device
+        del sample_index, seed, cot_signals, device, context
         return CompressionPlan(None, num_cot_tokens, num_cot_tokens)
 
     def materialize(
@@ -316,9 +343,10 @@ class BaseCompressionMethod(CompressionMethod):
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
         prefix_ids: list[int] | None = None,
+        context: SplitContext | None = None,
     ) -> torch.Tensor | None:
         del cot_ids, sample_index, seed, tokenizer, model, device, cot_signals
-        del prefix_ids
+        del prefix_ids, context
         return None
 
 
@@ -344,8 +372,9 @@ class NoCotCompressionMethod(CompressionMethod):
         seed: int,
         cot_signals: dict[str, torch.Tensor | None] | None,
         device: torch.device,
+        context: SplitContext | None = None,
     ) -> CompressionPlan:
-        del sample_index, seed, cot_signals, device
+        del sample_index, seed, cot_signals, device, context
         # num_slots=0 => compressed_messages rewrites the interior to "" (K
         # placeholders with K=0), and no slots are spliced.
         return CompressionPlan(0, num_cot_tokens, 0)
@@ -360,9 +389,10 @@ class NoCotCompressionMethod(CompressionMethod):
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
         prefix_ids: list[int] | None = None,
+        context: SplitContext | None = None,
     ) -> torch.Tensor | None:
         del cot_ids, sample_index, seed, tokenizer, model, device, cot_signals
-        del prefix_ids
+        del prefix_ids, context
         return None
 
 
@@ -399,10 +429,11 @@ class EmbeddingCompressionMethod(CompressionMethod):
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
         prefix_ids: list[int] | None = None,
+        context: SplitContext | None = None,
     ) -> torch.Tensor | None:
         del tokenizer, prefix_ids
         values = _patching_values(self, cot_signals, device)
-        spans = _split_spans(self, len(cot_ids), values, sample_index, seed)
+        spans = _split_spans(self, len(cot_ids), values, sample_index, seed, context)
         weight_signal = self.weight_signal()
         weights = (
             None
@@ -435,6 +466,62 @@ class SimpleMeanCompressionMethod(EmbeddingCompressionMethod):
         # it by a factor of c. See Embedding Compress in arXiv:2505.16552.
         c = embeds.shape[1]
         return embeds.sum(dim=1) / (c**0.5)
+
+
+@dataclass(frozen=True)
+class StepMeanCompressionMethod(EmbeddingCompressionMethod):
+    """Every latent of a step holds the arithmetic mean of that step's embeddings.
+
+    The paragraph encoder's `step_mean` initializer, and so its step-0 state: as a
+    training-free method it is the control that asks whether the encoder beats the
+    seed it starts from. Under token patching each step is one span and this is a
+    per-patch mean.
+
+    A plain mean, NOT `SimpleMeanCompressionMethod`'s `sum / sqrt(c)`. That
+    rescaling assumes zero-mean token embeddings; Qwen3's share a mean direction
+    worth ~35% of a token's RMS, so over real steps `sum / sqrt(c)` grows as
+    sqrt(c) -- 1.9x the decoder's input scale at the median step, 8.5x on the
+    longest -- while the mean stays at 0.35-0.64x across every length (measured on
+    300 val traces).
+    """
+
+    def __init__(self, patching: PatchingMethod | None = None) -> None:
+        super().__init__(
+            name=_compose_name("step_mean", patching),
+            method_family="step_mean",
+            patching=patching,
+        )
+
+    def reduce_patches(
+        self,
+        embeds: torch.Tensor,
+        weights: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del weights
+        return embeds.mean(dim=1)
+
+    def materialize(
+        self,
+        cot_ids: list[int],
+        sample_index: int,
+        seed: int,
+        tokenizer: Any,
+        model: Any,
+        device: torch.device,
+        cot_signals: dict[str, torch.Tensor | None] | None,
+        prefix_ids: list[int] | None = None,
+        context: SplitContext | None = None,
+    ) -> torch.Tensor | None:
+        """Pool each STEP once, then hand every latent its step's vector."""
+        del tokenizer, prefix_ids
+        values = _patching_values(self, cot_signals, device)
+        layout = _step_layout(self, len(cot_ids), values, sample_index, seed, context)
+        with torch.no_grad():
+            embeds = model.get_input_embeddings()(torch.tensor(cot_ids, device=device))
+            steps = _reduce_spans_grouped(
+                self, embeds, None, list(layout.steps), device
+            )
+            return steps[torch.tensor(layout.step_of_latent, device=device)]
 
 
 @dataclass(frozen=True)
@@ -563,10 +650,11 @@ class RandomCompressionMethod(CompressionMethod):
         device: torch.device,
         cot_signals: dict[str, torch.Tensor | None] | None,
         prefix_ids: list[int] | None = None,
+        context: SplitContext | None = None,
     ) -> torch.Tensor | None:
         del prefix_ids
         values = _patching_values(self, cot_signals, device)
-        spans = _split_spans(self, len(cot_ids), values, sample_index, seed)
+        spans = _split_spans(self, len(cot_ids), values, sample_index, seed, context)
         weight = model.get_input_embeddings().weight
         high = _regular_vocab_bound(tokenizer, int(weight.shape[0]))
         ids = random_slot_token_ids(len(spans), sample_index, seed, high)
@@ -593,6 +681,9 @@ def build_patching_method(
     ratio = float(patching_cfg.compression_ratio)
     if strategy == "uniform":
         return UniformPatchingMethod(compression_ratio=ratio)
+    # Content-defined but signal-free: no cache, no precompute, no GPU.
+    if strategy == "paragraph":
+        return ParagraphStepPatchingMethod(compression_ratio=ratio)
     if strategy == "random":
         return RandomPatchingMethod(max_exponent=int(patching_cfg.random.max_exponent))
     for signal in SIGNALS:
@@ -614,6 +705,7 @@ _SIMPLE_METHODS = {
 _PATCHED_METHODS = {
     "random": RandomCompressionMethod,
     "simple_mean": SimpleMeanCompressionMethod,
+    "step_mean": StepMeanCompressionMethod,
 }
 
 # Signal-weighted-mean families: `patching` + `temperature`, and the pooling
