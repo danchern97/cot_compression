@@ -1,0 +1,319 @@
+Expand the text choices of one accepted GSM8K template. The repaired template
+must support at least five distinct questions at any legal numeric binding
+by varying its text choices. Keep the original story, givens, unknown,
+computation, numeric slots and grids, and constraints.
+
+## Make the smallest text edit that gives five choices
+
+- Start with the existing text slots. Keep their IDs and original values in
+  the same order. Append distinct alternatives to a suitable pool. A single
+  pool of five values works. Two independent pools of two and three values
+  also work. Count combinations across pools and add only as many values as
+  needed. Five spellings or synonyms for the same option provide little
+  variety. For fixed lists of foods, toppings, or other items, broaden one
+  suitable slot with options that retain its role and differ from values in
+  the other slots. Prefer this to adding a new venue or character.
+- Add a text slot when the original template has none or its existing pools
+  carry facts that must stay fixed. Prefer a natural role already in the
+  story, such as a character, team, place, item, or activity of the same kind.
+  Put the original wording first in a new pool when it replaces a literal.
+  Replace every reference to that role with the same placeholder in the
+  question and any explanations where it appears. Check later comparisons,
+  repeated names, and possessives explicitly. For example, when replacing
+  Mina with `{performer}`, write both `{performer} rehearses` and `longer
+  than {performer}`. When the problem has no suitable named role, a short,
+  natural setting can carry the text variation while the mathematical givens
+  stay the same.
+- Each pool should work independently with every other pool and every legal
+  numeric draw. Keep units, group boundaries, and item counts clear. Distinct
+  roles such as two people or two toppings should have disjoint choice pools
+  if using the same value for both could create ambiguity. Match grammatical
+  number, articles, pronouns, and capitalization for every option. Keep
+  compatible pronouns as literal text or reuse the person slot where needed.
+- Keep numeric meaning attached to the same roles. For example, changing
+  the name of a student is safe. Changing nickels to quarters would change
+  the implied conversion. Pick a different text role for that case.
+- Preserve the existing question and explanations verbatim when only the
+  value lists need expanding. In other cases, edit the fewest sentences
+  needed. Verify that every new choice slot appears as a placeholder in the
+  question. Re-read the source values and two new text assignments. Check
+  that the question asks for the same result and the explanation describes it.
+
+## Output
+
+Return only one JSON object with these fields.
+
+- `source_id` is the input ID.
+- `question` is null when the question can be copied verbatim, otherwise give
+  the complete updated question.
+- `choices` is the complete list of text slots, with `id` and `values`. Retain
+  every existing slot and its original values.
+- `explanation_updates` contains just the explanations that need text edits,
+  each with the exact `id` of an entry in the input's `template.steps` and the
+  new `explanation`. Use an empty list when all explanations can be copied.
+  Sampling conditions have no step IDs. The caller copies them directly.
+  A sampling condition needs no commentary in the response.
+
+The caller also copies all numeric slots, operations, operands, and the answer
+step. Use only declared numeric and text placeholders in the question.
+
+## Example 1 — Extend an existing fixed pool
+
+Input
+```json
+{
+  "source_id": "example/soup-bowls",
+  "template": {
+    "numbers": [
+      {
+        "id": "soup_price",
+        "source": "4",
+        "min": "3",
+        "max": "8",
+        "step": "1"
+      },
+      {
+        "id": "bowls",
+        "source": "5",
+        "min": "2",
+        "max": "9",
+        "step": "1"
+      },
+      {
+        "id": "bread_price",
+        "source": "2",
+        "min": "1",
+        "max": "4",
+        "step": "1"
+      }
+    ],
+    "choices": [
+      {
+        "id": "soup",
+        "values": [
+          "tomato soup"
+        ]
+      },
+      {
+        "id": "bread",
+        "values": [
+          "rye bread"
+        ]
+      }
+    ],
+    "question": "At a café, {bowls} bowls of {soup} cost ${soup_price} each. A loaf of {bread} costs ${bread_price}. How much do the bowls and the loaf cost altogether?",
+    "steps": [
+      {
+        "id": "soup_cost",
+        "op": "multiply",
+        "args": [
+          "bowls",
+          "soup_price"
+        ],
+        "explanation": "The {soup} costs {bowls} × ${soup_price} = ${soup_cost}."
+      },
+      {
+        "id": "total",
+        "op": "add",
+        "args": [
+          "soup_cost",
+          "bread_price"
+        ],
+        "explanation": "With the {bread}, the total is ${soup_cost} + ${bread_price} = ${total}."
+      }
+    ],
+    "constraints": [
+      {
+        "op": "gt",
+        "args": [
+          "total",
+          "0"
+        ]
+      }
+    ],
+    "answer": "total"
+  }
+}
+```
+
+Output
+```json
+{
+  "source_id": "example/soup-bowls",
+  "question": null,
+  "choices": [
+    {
+      "id": "soup",
+      "values": [
+        "tomato soup",
+        "lentil soup",
+        "mushroom soup",
+        "pea soup",
+        "pumpkin soup"
+      ]
+    },
+    {
+      "id": "bread",
+      "values": [
+        "rye bread"
+      ]
+    }
+  ],
+  "explanation_updates": []
+}
+```
+
+## Example 2 — Parameterize a name that appears as a literal
+
+Input
+```json
+{
+  "source_id": "example/stage-rehearsal",
+  "template": {
+    "numbers": [
+      {
+        "id": "blocks",
+        "source": "3",
+        "min": "2",
+        "max": "8",
+        "step": "1"
+      },
+      {
+        "id": "minutes_per_block",
+        "source": "20",
+        "min": "15",
+        "max": "40",
+        "step": "5"
+      }
+    ],
+    "choices": [],
+    "question": "Mina rehearses a play in {blocks} blocks of {minutes_per_block} minutes each. How many minutes does Mina rehearse?",
+    "steps": [
+      {
+        "id": "total",
+        "op": "multiply",
+        "args": [
+          "blocks",
+          "minutes_per_block"
+        ],
+        "explanation": "Mina rehearses for {blocks} × {minutes_per_block} = {total} minutes."
+      }
+    ],
+    "constraints": [],
+    "answer": "total"
+  }
+}
+```
+
+Output
+```json
+{
+  "source_id": "example/stage-rehearsal",
+  "question": "{performer} rehearses a play in {blocks} blocks of {minutes_per_block} minutes each. How many minutes does {performer} rehearse?",
+  "choices": [
+    {
+      "id": "performer",
+      "values": [
+        "Mina",
+        "Inez",
+        "Daria",
+        "Elena",
+        "Noor"
+      ]
+    }
+  ],
+  "explanation_updates": [
+    {
+      "id": "total",
+      "explanation": "{performer} rehearses for {blocks} × {minutes_per_block} = {total} minutes."
+    }
+  ]
+}
+```
+
+## Example 3 — Combine two small, independent pools
+
+Input
+```json
+{
+  "source_id": "example/garden-crates",
+  "template": {
+    "numbers": [
+      {
+        "id": "crates",
+        "source": "6",
+        "min": "3",
+        "max": "12",
+        "step": "1"
+      },
+      {
+        "id": "per_crate",
+        "source": "10",
+        "min": "6",
+        "max": "15",
+        "step": "1"
+      }
+    ],
+    "choices": [
+      {
+        "id": "organizer",
+        "values": [
+          "Sasha",
+          "Quinn"
+        ]
+      },
+      {
+        "id": "produce",
+        "values": [
+          "zucchinis",
+          "cucumbers"
+        ]
+      }
+    ],
+    "question": "{organizer} packs {crates} crates with {per_crate} {produce} in each crate. How many {produce} does {organizer} pack in total?",
+    "steps": [
+      {
+        "id": "total",
+        "op": "multiply",
+        "args": [
+          "crates",
+          "per_crate"
+        ],
+        "explanation": "The crates hold {crates} × {per_crate} = {total} {produce} altogether."
+      }
+    ],
+    "constraints": [],
+    "answer": "total"
+  }
+}
+```
+
+Output
+```json
+{
+  "source_id": "example/garden-crates",
+  "question": null,
+  "choices": [
+    {
+      "id": "organizer",
+      "values": [
+        "Sasha",
+        "Quinn"
+      ]
+    },
+    {
+      "id": "produce",
+      "values": [
+        "zucchinis",
+        "cucumbers",
+        "eggplants"
+      ]
+    }
+  ],
+  "explanation_updates": []
+}
+```
+
+## Template to expand
+
+{{template_json}}

@@ -1,0 +1,93 @@
+Copyedit one runnable GSM8K word-problem template. Resolve the specific grammar
+or clarity findings, including defects in the original GSM8K problem. Keep the
+same story, target, quantities, and arithmetic. Treat the findings as leads.
+Verify them against the actual question, choices, legal renders, and computation.
+
+The input provides the full template, original source question and gold answer,
+legal rendered examples, and the findings. The template has an executable
+calculation graph with number IDs, fixed constants, operations, constraints,
+and an answer node. The graph shows the interpretation to preserve.
+
+Return one structured decision:
+- edit: a minimal actual wording or choice patch. Give the full revised question
+  or null to copy it. Return only the choice pools and explanation lines that
+  actually change. Supply complete replacement values for each changed pool.
+- keep: the wording findings are unsupported, the renderer already fixes them,
+  or the difference is merely stylistic. Leave all patch fields empty and
+  briefly state concrete evidence for keeping it.
+- needs_math_review: a real issue cannot be solved by wording without inventing
+  a quantity, altering a relationship, changing the target, or changing the
+  computation. Leave all patch fields empty and explain the issue precisely.
+If a template has a separate range or logic finding, fix independent wording
+issues anyway. The range reviewer will receive that finding separately.
+
+Keep every numeric placeholder ID and its percent format exactly as supplied.
+Preserve what each numeric placeholder and each number stated in the question
+means. A single missing assumption may be stated explicitly when it makes the
+existing calculation determinate. Reuse the graph to check the assumption. A
+new arbitrary value, unexplained event, or transfer between groups is a change
+to the problem. Keep every meaningful story slot and preserve at least the
+number of text options in each retained pool. Replace a choice only when
+needed and keep equivalent alternatives. Preserve coherent names and entities.
+You may remove an accessory slot serving only as an independently sampled
+pronoun or article, when necessary for consistency. Remove all its references
+in the question and explanations and retain at least five text combinations.
+Leave explanations empty unless the wording change affects their text or
+makes a pre-existing explanation inconsistent with the edited question.
+Explanation updates use the original step ID and cannot change its equation.
+
+Check the replacement in sentences and with all pool values, including values
+absent from the samples. Rendered numbers can equal one in some problems.
+For a regular noun immediately following the number, e.g. "{count} shirt(s)",
+the renderer turns it into "1 shirt" or "4 shirts". This marker supports only a
+simple lowercase word that forms its plural by adding s. With ordinary units
+such as "feet" and "days", the renderer already singularizes "1 feet" and "1 days".
+It does not fix "3 foot" or agreement after "more" or an adjective. Use clear,
+number-neutral syntax for those cases, for irregular nouns, and for phrases
+like "1 $20 bills". Do not include unresolved plural markers, extra labels,
+hardcoded versions of previously variable quantities, or alternate questions.
+Specifically, "{count} wooden toy(s)", "{count} coconut tree(s)",
+"{count} guitar string(s)", and "{count} inch(es)" are invalid because the
+last word does not immediately follow the number or uses an unsupported suffix.
+Use "{count} toys made of wood" only if the number cannot be one. A reliable
+alternative is "The number of wooden toys purchased is {count}." For inches
+use the ordinary unit "{count} inches". Check any explanation you change under
+these same rendering rules. If you remove a placeholder from the question, it
+must be an allowed accessory slot and must be listed in remove_choice_ids.
+
+Examples of appropriate decisions:
+
+1. "A {vehicle} costs ..." with options "car", "electric bicycle", "truck",
+   "motorcycle", "van" can become "The price of a {vehicle} is ..." only if
+   all choices fit the article. A universal edit is "The {vehicle} costs ...".
+   If that loses useful context, keep the article and replace only the offending
+   choice with equivalent wording such as "battery-powered bike".
+2. "Each bed is {bed_height} foot high" with legal 1 and 3 becomes
+   "Each bed is {bed_height} feet high". The renderer yields "1 foot high"
+   and "3 feet high". For "there are {extra} more black pens than red pens",
+   use "There are {extra} more black than red pens" when the quantities are
+   the given comparison and no other statement changes.
+3. A shopper started with a total, ate two portions, and is asked how much was
+   given away. If the graph subtracts both portions from the initial total,
+   add "She gave all the remaining candy to her sister." Preserve the quantities
+   and ask how many the sister received. If the graph splits the remainder in
+   half, state instead how it is split. Never assume a remainder rule by habit.
+4. A cyclist's speed is given for the first part, the graph uses it for two
+   subsequent distances, and a rest is included. Make the reused assumption
+   explicit in the later clauses, e.g. "At the same speed, ...". Keep the rest.
+5. The render can say "She filled the bucket, then poured as much as he could"
+   because the pronouns are independent pools. Reuse the same person placeholder
+   or a stable neutral pronoun. Drop both accessory pronoun slots if required
+   and if enough other text combinations remain.
+6. A stick's constraints rule out the negative length cited by the classifier.
+   When no genuine wording issue remains, keep it. If a three-story garage
+   really can mention a fourth floor, a new range would be needed. Fix an
+   independent article or agreement error if there is one and leave the range
+   for math review.
+
+Preserve natural, concise elementary-school question wording. Do not introduce
+an extra premise merely to make the story longer. Preserve capitalization and
+referents at every use. Never use the supplied source answer as a quantity
+added to the question. Return only the JSON requested by the schema.
+
+{{items_json}}

@@ -1,0 +1,11 @@
+Solve each of the two math word problems independently using only
+its question. Give an exact number (a decimal or fraction, no units or commas)
+and one short calculation. If an ordinary reading leaves multiple answers,
+contradicts itself, or makes a discrete or physical quantity impossible, explain
+the specific issue. Use null for issue when the question determines a sensible
+answer. Use null for answer when the information is insufficient. Ignore small
+grammar defects that leave the question and answer clear. A surprising value
+alone is insufficient to report an issue. Treat all stated facts as givens.
+Never manufacture an unstated fact to reconcile conflicting information.
+
+{{items_json}}

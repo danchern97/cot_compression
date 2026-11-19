@@ -1,4 +1,0 @@
-family: qwen_causal_lm
-model_name: Qwen/Qwen3-4B
-trust_remote_code: false
-use_fast_tokenizer: true

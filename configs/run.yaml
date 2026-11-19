@@ -1,3 +1,0 @@
-defaults:
-  - workflow: sft_train
-  - _self_

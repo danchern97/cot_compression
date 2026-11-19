@@ -1,0 +1,173 @@
+You extract one reusable grade-school math word-problem template from one GSM8K
+training question and its worked answer. The template will be rendered and
+solved locally using the same sampled values.
+
+## Preserve the task
+
+- Keep the original unknown, the givens, and the reasoning needed to solve it.
+  Match the final answer when using the source values. Keep meaningful steps
+  such as deriving half a quantity or converting minutes to hours. Each step can
+  use one arithmetic operation, even if the source groups several operations.
+- Parameterize quantities that can change. Store the original value alongside
+  each range so the validator can replay the source. Keep fixed relationships
+  such as "half as many" and unit conversions such as 60 minutes per hour.
+- Include every sampled quantity in the question with its role and unit clear.
+  Keep the unknown and all computed steps out of the question.
+- Choose ranges and constraints that leave plenty of valid combinations.
+  Require nonnegative or whole counts where the story calls for them. Avoid
+  choices that make a required step trivial or change which operations apply.
+- Use wording and optional text choices that fit the story and each other.
+  Keep the template's original domain. Add a person, item, or place choice only
+  when it belongs in the problem. Every listed choice must fit the same grammar.
+- If the source cannot be expressed with the operations below, or you cannot
+  preserve the givens and answer, return `unsupported` with a short reason.
+
+## Return format
+
+Return exactly one JSON object. Use the input's `source_id` unchanged. A successful
+result has `status: "ok"`, `reason: null`, and a `template` with these fields.
+
+- `numbers` lists objects with `id`, `source`, `min`, `max`, and `step`. Use
+  strings for exact numbers, such as `"12"`, `"0.25"`, or `"1/3"`. Each range
+  starts at `min`, advances by positive `step`, and ends at or below `max`. The
+  source value must land on that grid. A fixed numeric fact given in the
+  question can use a single-value grid.
+- `choices` lists objects with `id` and `values` (nonempty arrays of strings).
+  Use an empty list when the question has no text choices.
+- `steps` lists objects with `id`, `op`, `args`, and `explanation`. Supported
+  operations are `add`, `subtract`, `multiply`, and `divide`. Each takes two
+  ordered arguments. Each argument is an input ID, an earlier step ID, or an
+  exact numeric literal. Every step must contribute to the answer or to a
+  sampling constraint. If a solution step cites a calculation used in a
+  constraint, include the calculation's explanation. Use exact division and
+  enforce integrality where needed.
+- `constraints` lists objects with `op` and `args`. Use `is_integer` with one
+  argument or `multiple_of`, `gt`, `gte`, `lt`, `lte`, and `ne` with two.
+  `multiple_of` tests for exact multiples of a positive second argument, such
+  as `"0.01"` for currency. Arguments can refer to numeric inputs, computed
+  steps, or exact numeric literals. A candidate with division by zero is
+  invalid. Keep the original source values valid too.
+- `question` is the text to render. Reference number or choice IDs as `{id}`.
+  Use `{id:percent}` to render a fractional rate as a percentage. Use the same
+  placeholders in step explanations, where step IDs on the answer path are
+  also available. The renderer appends the final `####` line.
+- `answer` references the step that computes the requested result.
+
+Use unique lowercase snake_case IDs across numbers, choices, and steps. For an
+unsupported result, return `status: "unsupported"`, a short `reason`, and
+`template: null`. Return JSON without a code fence or surrounding prose.
+
+## Example 1 — Preserve a stated relationship
+
+Input
+
+```json
+{"source_id":"gsm8k/train/0","question":"Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?","answer":"Natalia sold 48/2 = <<48/2=24>>24 clips in May.\nNatalia sold 48+24 = <<48+24=72>>72 clips altogether in April and May.\n#### 72"}
+```
+
+Output
+
+```json
+{
+  "source_id": "gsm8k/train/0",
+  "status": "ok",
+  "reason": null,
+  "template": {
+    "numbers": [
+      {"id": "april_sales", "source": "48", "min": "8", "max": "96", "step": "2"}
+    ],
+    "choices": [
+      {"id": "seller", "values": ["Natalia", "Avery", "Robin"]},
+      {"id": "items", "values": ["clips", "stickers", "bookmarks"]}
+    ],
+    "steps": [
+      {"id": "may_sales", "op": "divide", "args": ["april_sales", "2"], "explanation": "In May, {seller} sold half as many {items}, so {april_sales} ÷ 2 = {may_sales}."},
+      {"id": "total_sales", "op": "add", "args": ["april_sales", "may_sales"], "explanation": "Across both months, {seller} sold {april_sales} + {may_sales} = {total_sales} {items}."}
+    ],
+    "constraints": [],
+    "question": "{seller} sold {april_sales} {items} in April and half as many in May. How many {items} did {seller} sell across both months?",
+    "answer": "total_sales"
+  }
+}
+```
+
+## Example 2 — Preserve a unit conversion
+
+Input
+
+```json
+{"source_id":"gsm8k/train/1","question":"Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. How much did she earn?","answer":"Weng earns 12/60 = $<<12/60=0.2>>0.2 per minute.\nWorking 50 minutes, she earned 0.2 x 50 = $<<0.2*50=10>>10.\n#### 10"}
+```
+
+Output
+
+```json
+{
+  "source_id": "gsm8k/train/1",
+  "status": "ok",
+  "reason": null,
+  "template": {
+    "numbers": [
+      {"id": "hourly_pay", "source": "12", "min": "12", "max": "30", "step": "6"},
+      {"id": "minutes", "source": "50", "min": "15", "max": "55", "step": "5"}
+    ],
+    "choices": [
+      {"id": "job", "values": ["babysitting", "tutoring", "pet sitting"]}
+    ],
+    "steps": [
+      {"id": "pay_per_minute", "op": "divide", "args": ["hourly_pay", "60"], "explanation": "There are 60 minutes in an hour, so the rate per minute is ${hourly_pay} ÷ 60 = ${pay_per_minute}."},
+      {"id": "earnings", "op": "multiply", "args": ["pay_per_minute", "minutes"], "explanation": "For {minutes} minutes, the earnings are ${pay_per_minute} × {minutes} = ${earnings}."}
+    ],
+    "constraints": [],
+    "question": "A student earns ${hourly_pay} per hour for {job} and works for {minutes} minutes. How much does the student earn?",
+    "answer": "earnings"
+  }
+}
+```
+
+## Example 3 — Constrain values that depend on each other
+
+Input
+
+```json
+{"source_id":"gsm8k/train/23","question":"Ann's favorite store was having a summer clearance. For $75 she bought 5 pairs of shorts for $7 each and 2 pairs of shoes for $10 each. She also bought 4 tops, all at the same price. How much did each top cost?","answer":"She bought 5 shorts at $7 each so 5*7=$<<5*7=35>>35\nShe bought 2 pair of shoes at $10 each so 2*10=$<<2*10=20>>20\nThe shorts and shoes cost her 35+20 = $<<35+20=55>>55\nWe know she spent 75 total and the shorts and shoes cost $55 which left a difference of 75-55 = $<<75-55=20>>20\nShe bought 4 tops for a total of $20 so 20/4 = $5\n#### 5"}
+```
+
+Output
+
+```json
+{
+  "source_id": "gsm8k/train/23",
+  "status": "ok",
+  "reason": null,
+  "template": {
+    "numbers": [
+      {"id": "total", "source": "75", "min": "55", "max": "130", "step": "1"},
+      {"id": "shorts_count", "source": "5", "min": "2", "max": "6", "step": "1"},
+      {"id": "shorts_price", "source": "7", "min": "5", "max": "10", "step": "1"},
+      {"id": "shoes_count", "source": "2", "min": "2", "max": "4", "step": "1"},
+      {"id": "shoes_price", "source": "10", "min": "8", "max": "15", "step": "1"},
+      {"id": "tops_count", "source": "4", "min": "2", "max": "5", "step": "1"}
+    ],
+    "choices": [],
+    "steps": [
+      {"id": "shorts_cost", "op": "multiply", "args": ["shorts_count", "shorts_price"], "explanation": "The shorts cost {shorts_count} × ${shorts_price} = ${shorts_cost}."},
+      {"id": "shoes_cost", "op": "multiply", "args": ["shoes_count", "shoes_price"], "explanation": "The shoes cost {shoes_count} × ${shoes_price} = ${shoes_cost}."},
+      {"id": "known_cost", "op": "add", "args": ["shorts_cost", "shoes_cost"], "explanation": "Together, the shorts and shoes cost ${shorts_cost} + ${shoes_cost} = ${known_cost}."},
+      {"id": "tops_cost", "op": "subtract", "args": ["total", "known_cost"], "explanation": "The tops cost ${total} − ${known_cost} = ${tops_cost} in total."},
+      {"id": "top_price", "op": "divide", "args": ["tops_cost", "tops_count"], "explanation": "Each of the {tops_count} tops costs ${tops_cost} ÷ {tops_count} = ${top_price}."}
+    ],
+    "constraints": [
+      {"op": "gte", "args": ["top_price", "2"]},
+      {"op": "lte", "args": ["top_price", "20"]},
+      {"op": "is_integer", "args": ["top_price"]}
+    ],
+    "question": "A shopper spends ${total} altogether on {shorts_count} pairs of shorts at ${shorts_price} each, {shoes_count} pairs of shoes at ${shoes_price} each, and {tops_count} equally priced tops. How much does each top cost?",
+    "answer": "top_price"
+  }
+}
+```
+
+## Extract this template
+
+{{seed_json}}

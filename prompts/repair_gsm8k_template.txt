@@ -1,0 +1,29 @@
+Repair the proposed template using the source and the specific findings in the
+user message. The extraction examples above illustrate the format. Each entry
+has one source problem and one proposed template. Check the math from the source
+independently before deciding what to change. Preserve the quantities, target,
+and reasoning, and replay the original gold answer exactly. Clarify unstated
+ordinary assumptions if necessary. If the source is genuinely inconsistent or
+cannot take a sensible exact answer under its stated conditions, return
+unsupported with the exact conflict. Never force a match to an erroneous answer.
+
+- Numeric grids must include the original value and allow enough useful
+  variations. Local validation tries 128 independent uniform draws and requires
+  at least 10 valid draws and 2 different answers. Prefer coordinated grids
+  that satisfy divisibility and unit constraints by construction when possible.
+- Use only numeric slot IDs, preceding step IDs, or exact numeric literals as
+  arithmetic and constraint operands. Every question placeholder must be
+  declared, every declared slot must occur in the question, and explanations
+  may only use given quantities and displayed calculations available so far.
+- A helper calculation can be used only by a constraint. Its explanation
+  appears if a solution step refers to it. The answer can appear before a
+  helper used only for sampling. All arithmetic must contribute to either the
+  answer or a constraint.
+- The additional constraint 'multiple_of' accepts two arguments. It requires
+  the first to be an exact multiple of the positive second argument. Apply
+  multiple_of(amount, "0.01") to dollar amounts where appropriate.
+  Require whole-number counts for indivisible objects and prevent physically
+  impossible values. Use explicit units and avoid ambiguous fractional wording.
+- Check edge values, ordering, assumptions, text choice compatibility, and
+  dropped givens. Make the smallest changes that address the findings and
+  maintain the source problem. Return the structured extraction object.

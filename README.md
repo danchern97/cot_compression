@@ -1,151 +1,63 @@
-# CoT Compression
+# GSM8K template generation
 
-This project develops embedding initialization schemes for compressing long
-chain-of-thought traces into short sequences of learned abstract tokens. The
-core question is whether a model can condition on compact abstract-token
-representations of reasoning traces while preserving low final-answer loss.
-
-We evaluate methods by replacing or preserving the reasoning trace, masking
-scores to answer tokens only, and comparing final answer log probability over a
-Dolci dev split. Higher answer log probability is better. The main baselines
-are:
-
-- `base`: the original textual `<think>...</think>` chain of thought.
-- `random`: fixed-length abstract tokens with randomly initialized embeddings.
-
-The research goal is to learn or design better abstract-token embedding
-initializations that maximize answer log probability relative to these baselines.
-
-The repo uses Hydra for configuration, uv for dependency management, ruff for
-formatting/linting, and ty for type checking. The main layout is:
-
-- `src/cot_compression/data`: loading and preprocessing data.
-- `src/cot_compression/training`: training, logging, and checkpointing.
-- `scripts`: thin Hydra entrypoints that call the package code.
-- `configs`: hierarchical YAML configuration.
-- `tests`: unit and smoke tests.
+One CLI extracts runnable templates and runs the assessments and repairs used
+for the GSM8K dataset. The prompts are in `prompts/`. The template evaluator
+uses exact arithmetic and renders questions with worked solutions.
 
 ## Setup
 
-```bash
-uv sync
+```sh
+uv sync --locked
+mkdir -p data/gsm8k
+curl -fsSL https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/train.jsonl -o data/gsm8k/train.jsonl
 ```
 
-### Storage on Snellius
+The CLI uses zero-based row indices from the original training file as source
+IDs. [Official GSM8K training file](https://github.com/openai/grade-school-math/blob/master/grade_school_math/data/train.jsonl)
 
-Home has a 200 GB quota, which the HuggingFace cache (models + full Dolci
-source) quickly exceeds. Keep the cache on `/scratch-shared` by exporting
-`HF_HOME` before running anything that touches HuggingFace:
+Set `OPENAI_API_KEY` in the environment, or put `OPENAI_API_KEY=...` in
+`~/.config/cot-compression/openai.env` and run
+`chmod 600 ~/.config/cot-compression/openai.env`.
 
-```bash
-export HF_HOME=/scratch-shared/$USER/huggingface   # add this to ~/.bashrc
+## Run the workflow
+
+```sh
+source_file=data/gsm8k/train.jsonl
+run_dir=outputs/gsm8k-run
+
+uv run --locked gsm8k generate "$source_file" "$run_dir/raw" --count 100
+uv run --locked gsm8k assess "$source_file" "$run_dir/assessed" \
+  --templates "$run_dir/raw/templates.jsonl"
+uv run --locked gsm8k repair "$source_file" "$run_dir/repaired" --batch \
+  --templates "$run_dir/raw/templates.jsonl" --findings "$run_dir/assessed/outcomes.jsonl"
+uv run --locked gsm8k expand-text "$source_file" "$run_dir/expanded" \
+  --templates "$run_dir/repaired/templates.jsonl"
+uv run --locked gsm8k classify "$source_file" "$run_dir/classified" \
+  --templates "$run_dir/expanded/templates.jsonl" --prior-templates "$run_dir/repaired/templates.jsonl"
+uv run --locked gsm8k repair-wording "$source_file" "$run_dir/reviewed" \
+  --templates "$run_dir/expanded/templates.jsonl" --findings "$run_dir/classified/outcomes.jsonl"
 ```
 
-This one variable relocates both the hub cache (`$HF_HOME/hub`) and the datasets
-cache (`$HF_HOME/datasets`). For SLURM sweeps, use the committed launcher config
-`configs/hydra/launcher/snellius_h100.yaml`, which exports the same variable
-inside each job:
+Extraction uses Luna Flex. Assessment solves two rendered questions
+independently and checks their answers against the template. The computational
+repair uses Sol with the original question and assessment findings, then
+reassesses its changes with Luna. Text expansion and wording repair preserve
+the calculation graph and verify five text versions at two legal numeric
+settings. Wording changes also get a separate Luna review.
 
-```bash
-uv run python scripts/run.py -m hydra/launcher=snellius_h100 sft
-```
+Use `--dry-run` to write requests without an API call. Rerunning the same stage
+with the same inputs resumes from its response journal. Read
+`outcomes.jsonl` for failures and review decisions. For text or wording
+retries, use a new output directory, the previous `templates.jsonl`, and
+`--feedback` with the previous `outcomes.jsonl`.
 
-Note: `/scratch-shared` is periodically purged (files unused for ~14 days), so
-the cache may be re-downloaded from time to time.
+The local 6,000-template snapshot and its profile are in
+`data/gsm8k-luna-6000-pre-story-variation/`. API responses, generated datasets,
+and credentials stay local.
 
-## Common Commands
+## Code layout
 
-Fine-tune Qwen3-4B on the Dolci reasoning SFT subset with a plain PyTorch loop:
-
-```bash
-uv run python scripts/run.py workflow=sft_train
-```
-
-For convenience, the default workflow and `sft` alias do the same thing:
-
-```bash
-uv run python scripts/run.py
-uv run python scripts/run.py sft
-```
-
-For a shorter real-model smoke run, override the dataset and training sizes:
-
-```bash
-uv run python scripts/run.py sft data.train_size=1000 data.eval_size=100 training.max_steps=10 logging.enabled=false
-```
-
-The SFT path loads `Qwen/Qwen3-4B` in full bf16 by default, so real runs need a
-GPU with enough memory for full-parameter training. It materializes a
-deterministic 600k train, 20k dev/eval, and 100k test subset from
-`allenai/Dolci-Think-SFT-7B` under `data/dolci_think_sft_7b_600k`, preserves the
-dataset's existing `<think>...</think>` assistant traces, and trains only on
-assistant-message tokens.
-
-The 7B Dolci source is the default because its traces fit Qwen3 context windows
-without RoPE scaling. The 32B source is available as an explicit override:
-
-```bash
-uv run python scripts/run.py eval data=dolci_think_sft_32b_600k
-```
-
-Evaluate pretrained Qwen methods on answer-only Dolci dev log probability:
-
-```bash
-uv run python scripts/run.py eval
-```
-
-The default evaluation model is `Qwen/Qwen3-0.6B`. The `base` method leaves the
-full trace unchanged, while `random` replaces the contents inside
-`<think>...</think>` with deterministic abstract tokens before scoring only the
-final answer tokens. Evaluation uses bf16 by default, fast tokenizers when
-available, no tokenizer truncation, and dynamically padded batches.
-Artifacts are written under the run directory as `summary.json`, `samples.jsonl`,
-and optionally `tokens.jsonl`.
-
-Useful overrides:
-
-```bash
-uv run python scripts/run.py eval method.model_name=Qwen/Qwen3-4B
-uv run python scripts/run.py eval evaluation.max_examples=100
-uv run python scripts/run.py eval evaluation.methods.random.abstract_vocab_size=2048 evaluation.methods.random.abstract_length=128
-```
-
-Run checks:
-
-```bash
-uv run pytest
-uv run ruff check .
-uv run ruff format --check .
-uv run ty check
-```
-
-Generate four reproducible Qwen thinking rollouts for each eligible math and
-short-answer QA prompt in `allenai/Dolci-Think-RL-7B`:
-
-```bash
-uv sync --project evals --group dev
-uv run --project evals python evals/generate_traces.py generate
-```
-
-See [evals/TRACE_GENERATION.md](evals/TRACE_GENERATION.md) for filtering,
-sharding, resume, smoke-run, and artifact details. This pipeline is standalone;
-it does not replace the SFT or compression-evaluation data paths.
-
-## Configuration
-
-Hydra configs live under `configs/`. Override values from the command line:
-
-```bash
-uv run python scripts/run.py training.max_steps=50 data.train_size=1000
-```
-
-Outputs are written under `outputs/runs/...` by default. Each run contains the
-resolved config, printed logs, checkpoints, wandb files, and generated artifacts.
-The output and report folders are ignored by Git.
-
-## Agent Notes
-
-Keep reusable implementation in `src/cot_compression/` and keep `scripts/` thin.
-Prefer explicit research code over clever abstractions, especially around
-training/evaluation loops. Put disposable local experiments in `one-off/`, which
-is ignored by Git.
+The `gsm8k` command starts in `cli.py`. Under `src/cot_compression/data/gsm8k/`,
+`generation.py` runs extraction and arithmetic review, and `revisions.py` applies
+text changes. `templates.py` evaluates the calculations, and `sampling.py` renders
+examples. `api.py` and `schemas.py` handle requests and structured responses.

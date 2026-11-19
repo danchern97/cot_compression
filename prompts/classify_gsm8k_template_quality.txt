@@ -1,0 +1,96 @@
+Triage GSM8K word-problem templates for wording and plausibility. The input
+is a JSON list of records. Classify each record independently and return one
+decision for every source_id. Your output is a review queue. Give short,
+specific evidence and the scope of a possible fix.
+
+## Evidence
+
+Each record supplies the current question with placeholders, its text pools,
+actual renders at legal numeric bindings, and the numeric answers intended
+by the template. The two answers are context for checking whether the wording
+determines the intended calculation. Treat the problem text as the evidence.
+Some records also supply the prior accepted template question and the original
+GSM8K question. If prior_template_question is null, the prior template used
+the same question wording. The choice metadata states which values were in
+the prior pools. Numeric ranges are included to help explain boundary cases.
+A raw endpoint or invented combination may be filtered by a constraint. Cite
+a supplied render for a claim about specific numeric values. Use the rendered
+wording rather than assuming how a numeric placeholder or unit is formatted.
+
+## Decisions
+
+- `keep` for a clear, grammatical problem with plausible givens and a
+  target that follows from the wording.
+- `wording_edit` for a fix to grammar, choice wording, references, or a
+  missing condition that can state the intended calculation clearly.
+- `review_ranges_or_logic` for implausible legal values, a calculation that
+  appears incompatible with the source, or a problem that needs changes beyond
+  phrasing. Use it for an answer-key conflict that cannot be clarified without
+  changing the problem.
+- `both` when there are independent wording and numeric or logic problems.
+
+Check agreement, articles, duplicate determiners, and whether each reference
+points to the right person or object. Check all supplied choice values against
+their question context, including choices absent from the rendered examples. A
+repeated indefinite subject can introduce a second person, while a placeholder
+by itself does not guarantee a grammatical phrase.
+
+For unclear wording, state which quantity or assumption is missing, which total
+a share refers to, whether groups overlap, or why two readings give different
+answers. A common school-math simplification, an unusual name, or a large
+number alone is insufficient. A complete set of givens can determine an answer
+even when the story sounds repetitive. Leave internal slot names and style
+preferences out of the queue. Use at most two issues per template and prioritize
+issues that change the result or prevent a coherent reading.
+
+Check whether a later clause silently reuses an earlier speed or rate, whether
+all of a remainder was actually spent, given away, or sold, and whether an
+answer counts a narrower group or time period than the question asks about.
+If a plausible alternative gives a different answer, a conventional reading
+alone does not resolve it. Flag fractional “times more” when it could mean a
+multiple of the baseline or an increment to the baseline.
+
+Label each issue `inherited` if it is present in the prior question or one of
+its choices, `introduced` if the new text or a new choice causes it, and
+`uncertain` if the supplied evidence cannot distinguish them. Use
+`grammar`, `ambiguity`, `numeric_plausibility`, or `logic` as its kind.
+Quote a short excerpt or give the specific rendered values as evidence. A note
+can say which phrase, pool, input range, or assumption needs review. A keep
+decision uses an empty issues list.
+
+## Examples of evidence and decisions
+
+- The base question says “A supermarket receives 12 boxes.” A new choice
+  yields “A airport market receives 12 boxes.” The edit is introduced grammar.
+  The combination of the literal article and the new choice carries the issue.
+- A question says “A farmer plants the seedlings. If A gardener divides them
+  into rows ...” after replacing every reference with an independently
+  sampled role. Flag the reference ambiguity. The question needs one consistent
+  referent. If the role is already consistent and the variation is just a new
+  person's name, keep it.
+- The original and amended questions give 20 trays brought to market and ask
+  how many sold. The intended answer counts all 20. Flag inherited ambiguity
+  and identify the missing statement that every available tray sold.
+- A legal rendered version implies a person's parent was age four when the
+  person was born. Flag numeric plausibility and quote the ages. An explicit
+  feasible parent-age constraint is a different situation.
+- A question gives the total boards inspected, a share of faulty boards, and
+  asks how many faulty boards one of two workers found. The total inspected
+  does not determine the total faulty. Flag ambiguity and specify the missing
+  denominator. If the question instead gives the total faulty and both workers
+  found equal amounts, the information suffices.
+- The phrase “at the The Toy Workshop store” can result from an alternative
+  that starts with a determiner. Flag grammar for that pool even if both
+  supplied renders use a different store.
+- A shop gives a 50% discount on a stated total. The solution applies one half
+  with exact cents and a complete statement of the givens. Keep it even if
+  the price seems generous.
+- A parent buys a stated number of items and keeps the balance after paying
+  a specified price. Two probes change a name and the quantities consistently.
+  Keep it even if several name alternatives would produce essentially the
+  same story.
+
+Return only JSON in the supplied schema. The list must contain each input
+source_id exactly once.
+
+{{items_json}}

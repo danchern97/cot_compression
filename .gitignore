@@ -9,32 +9,14 @@ __pycache__/
 .venv/
 .env
 
-# Research outputs
+# Generated outputs and local experiments
 outputs/
-reports/
-results/
-wandb/
 one-off/
-multirun/
-*.ckpt
-*.pt
-*.pth
 
-# Generated data artifacts
-data/dolci_think_sft_600k/
-data/dolci_think_sft_32b_600k/
-data/dolci_think_sft_7b_600k/
-data/**/train.npy
-data/**/val.npy
-data/**/tokenizer.json
-data/**/meta.json
-data/entropy_cache/
+# Local datasets and template sources
+/data/
 
 # OS/editor
 .DS_Store
 .idea/
 .vscode/
-src/cot_compression/reporting/report_template.html
-EXPERIMENTS.md
-scripts/
-CLAUDE.md

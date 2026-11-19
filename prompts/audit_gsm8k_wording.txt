@@ -1,0 +1,77 @@
+Audit a list of GSM8K copyedit proposals. Independently check each source_id
+and return one decision with concrete evidence. Each input contains the base
+and proposed wording, choice pools and explanation edits, actual legal renders,
+the original source question, the computation graph, and earlier findings.
+
+- accept: an edit resolves the flagged wording or ambiguity while preserving
+  the original story, inference target, legal quantities and their relations.
+  Also accept a keep decision if the alleged issues are absent, already handled
+  by rendering, or merely stylistic. Accept a needs_math_review decision when
+  the issue cannot be addressed by wording alone.
+- revise: a real in-scope issue remains, the proposed wording has a new defect,
+  or the edit changed a premise, relation, numeric meaning, or target. Briefly
+  state what to correct. Grammatical agreement, articles, grammatical pronoun
+  use, consistent referents, and enough clarity to derive the answer all
+  matter. Check choices and numeric probes, including the value one.
+- needs_math_review: a source or authorized numeric case contains a real issue
+  and no safe wording-only patch is evident. Explain the blocker.
+
+Before accepting, reason through one ordinary rendered question given the
+source's intended calculation. A clarifying assumption is fine only if it is
+the one the graph already uses. For example, say that all leftover candy went
+to the sister when the graph subtracts the amounts eaten and reports the whole
+remainder. Giving just some away would be underdetermined and giving half would
+change the arithmetic. Do not bless a new early rounding rule, quantity, total,
+or percentage basis unless it matches the graph. Check the actual question,
+not the model's description of what it changed.
+
+Judge the actual current text, even when the issue originated in the GSM8K
+source. The old source may have an ambiguity the proposed text can clarify.
+A different name, chosen article, or use of a neutral referent can be
+appropriate. Flag a patch that gains grammar by shrinking or exchanging
+meaningful story alternatives without a need. An independently selected
+"She"/"he" pair for the same person is accessory and may be removed if the
+same entity remains and other choice pools retain diversity. Do not reject an
+otherwise valid edit for unrelated range or logic work that was already
+flagged and is independent of the wording. Do not infer legal combinations
+from individual range endpoints. The graph constraints may exclude them.
+
+When specifying evidence, cite the exact remaining or introduced issue in the
+proposal or a rendered example. Return a short reason. Report at most the two
+most consequential issues in the single note. Use accept whenever the edit
+addressed the wording findings and no significant regression is evident.
+A patch need not imitate your own stylistic preference.
+Check the provided rendered text before asserting a renderer failure. A number
+followed by a regular noun marker such as "{count} apple(s)" is intentionally
+rendered as "1 apple" or "3 apples", and is valid when those forms are shown.
+Apply a/an by pronunciation, and quote the precise alternative that fails.
+Step IDs and field names are internal and are never printed to the reader.
+Review explanation edits in the actual rendered solution when provided. Flag
+an untouched explanation if the question edit made its wording inconsistent,
+or if it confirms a specific earlier finding. Assign revise only for a real
+defect and avoid requiring stylistic cleanup beyond the wording findings.
+
+Examples of decisions:
+
+- Base asks how many apples the adults ate after describing what the children
+  ate. The graph assigns the whole remainder to the adults. The proposal
+  states that the adults ate all remaining apples, reuses the same quantities,
+  and still asks how many the adults ate. Accept.
+- Base has a road distance and a speed. The proposal replaces miles with
+  kilometers in the distance only. The speed is unchanged in miles per hour.
+  Revise because it silently changes the time calculation.
+- The base prompt says there are three levels, then includes a fourth level
+  in a legal render. A separate choice gives “A airport garage.” An edit to
+  “The airport garage” can be accepted for wording even though the level count
+  is still in the range queue. A patch that silently says all garages have
+  four levels and drops the variable should be revised.
+- A room description has “{room_count} room(s)” with exact rendered examples
+  “1 room” and “3 rooms.” If this was the only issue, accept a keep. When
+  the render has “1 more rooms” and the proposal keeps that construction,
+  revise for agreement. A quantity-neutral comparison can make both cases work.
+- The target says how many goats, but the only stated animal count is the sum
+  of sheep and goats. If the proposal invents an equal split that the graph and
+  source do not imply, revise or route for math review. Changing goats to all
+  animals is a target change, even when the answer number then matches the key.
+
+{{items_json}}
