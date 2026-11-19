@@ -1,0 +1,126 @@
+Write the requested set of runnable grade-school math stories. Preserve the
+supplied calculation exactly. The request includes the base template, the
+required number of independently varying text slots, and a list of story IDs
+to fill. A repair request may also include accepted siblings and feedback for
+particular IDs. Write exactly the requested IDs, in the requested order. If
+the base provides a wording note, follow its executable graph and avoid the
+problem identified in the note.
+
+For a rejected draft with previous_proposal, keep its premise if suitable and
+make the smallest repair that addresses the feedback. Retain sound mappings,
+grids, and pools. For a story flagged as too close, choose a different activity
+or role for the quantities. Check the repair against the accepted siblings.
+
+## Develop the family
+
+Sketch the stories together before writing. Each needs a distinct activity or
+goal with an analogous calculation. Compare each against the base and its
+siblings. Changing clothing, products, names, or venue in the same event is
+just a text edit. Two different purchasing stories can still be the same
+premise. For example, the sum of two count-by-price products can instead
+measure the running time of two sets of clips, mass of two kinds of collected
+samples, two machines' energy use, two routes' traversal time, or points from
+two scored activities. Units and roles still need to fit the graph. Prefer
+familiar situations where the needed givens sound natural.
+
+## Preserve the calculation and write the new question
+
+The compiler carries over all operations, operands, step IDs, the answer
+step, literal constants, and constraints. Map every original numeric input to
+a descriptive ID, in original input order. Use that new ID everywhere you
+refer to the input. IDs are distinct ASCII lowercase identifiers. Make every
+numeric input visible in the question, including givens used only in sampling
+constraints. Put derived quantities in the solution. Preserve a fixed input
+and keep any varying input variable.
+
+Numeric grid replacements are optional. Leave them out when the original
+values and scale fit the new story. Where units or ranges make a story
+impossible, supply a replacement with the base input ID, a source value, min,
+max, and positive step as exact number strings. Min plus an integer multiple
+of step must reach the source. Every replacement source assignment must satisfy
+all inherited constraints jointly. Ensure the resulting grid plausibly has
+multiple legal settings yielding different answers. Prefer a continuous unit
+such as length, volume, mass, or elapsed time if the graph can yield fractions.
+For example, dividing 14 units among 3 recipients is fine for kilometers or
+liters, unlike an exact cash payment or indivisible objects. Retain fixed
+conversion constants and the direction of comparisons. Negative quantities
+can encode a change or a signed reading when explicitly described that way.
+
+Write one solution explanation per base step in step order. Declare each step
+result's ID in step_result_ids, in the same order, and use those IDs in the
+explanations. The names can describe the new story even when the inherited
+step IDs refer to the old story. They must be distinct from all given numbers,
+choices, and other steps. The compiler maps them back to the same ordered
+calculations. A hidden step can have an empty explanation. A visible step
+must not introduce a reference to a hidden step.
+
+Treat the question as a reader would. Specify the set that every count,
+proportion, and rate applies to. State whether categories are disjoint or
+included, whether one interval precedes another, and whether a rate is
+constant. A product of groups and per-group counts needs both givens. For
+example, if one-third of damaged parts are large, the number of damaged parts
+must be given. If a remainder subtracts groups from groups, don't call one
+count items. Verify the units of denominators and every intermediate result.
+
+## Add independently varying text roles
+
+Use target_choice_slots for the size of the choices array. Deviate only within
+the supplied min and max if needed for a natural story. A text option has a
+different ID and purpose from a numeric input. Every text slot
+needs two or more recognizably distinct values. Offer enough combinations for
+at least five different questions with the same numbers. For two slots, use
+three choices per role when practical. Vary participants, kinds of objects,
+locations central to the event, or properties of things the question actually
+counts or measures. Avoid filler, arbitrary members of anonymous groups, and
+splitting a name into separate slots. Keep different participant pools disjoint.
+
+Choose a consistent grammatical role for each slot. A stable head noun works
+well when options have varying articles or plural forms. Test each choice in
+the actual sentence and solution. Avoid a fixed a/an before a choice that can
+start with a different sound, or a choice value that includes its own article.
+Use a stable noun or a definite article where appropriate.
+
+Check any count whose range allows one. The input lists potentially affected
+base slots. Intermediate results can also be one. For an optional count, a
+grid starting at two is fine when it fits the story and all inherited
+constraints. For any count that can be one, prefer wording such as "There are
+three teams. The number of seedlings that {first_team} plants is {first_count}."
+In a worked step use "The total number of seedlings is {a} + {b} = {total}."
+These sentences work at one and at other legal values. Avoid "plants
+{first_count} {species} seedlings" and "{total} pieces of equipment" when
+the count can be one. Use `{count} item(s)` only for a regular single noun
+and an integer count, with nothing between the number and the noun. Do not
+hardcode a particular choice value in the solution.
+
+## Examples
+
+Suppose a shop sold {first_boxes} boxes at {first_price} dollars each and
+{second_boxes} boxes at {second_price} dollars each. The graph multiplies each
+count and its rate then adds the products. One story uses two groups of
+planetarium clips with given duration per clip. A second uses two named field
+teams collecting different kinds of samples, with given mass per sample. The
+questions ask for the combined time and mass, respectively. Neither story
+should describe selling something. Separate choices can vary {venue} and
+{clip_topic}, or {first_team} and {second_team}. A story about two kinds of
+coins with fixed value per coin may be different from a sale, but avoid other
+nearby shopping and finance premises if the family already has one.
+
+If the next step divides the combined total by a batch size, make explicit
+what is being split and what the quotient counts. For graphs retaining a
+constant of 60, a duration in minutes and hours can explain the conversion.
+If the graph subtracts a fixed number of minutes afterward, spell out when
+that time is removed. Use the new numeric IDs in the question and solution.
+
+## Return structured JSON
+
+Return the source ID and a variants array. Each variant contains variant_id,
+premise, question with placeholders, numeric_ids in the order of base inputs,
+grid_overrides, choices, step_result_ids, and explanations as strings in base
+step order. Verify that the question's placeholders are exactly the union of
+numeric_ids and the supplied choice IDs. Do not omit a given by hardcoding
+its sample value. Ensure the explanations cite only those IDs and declared
+step result IDs up to their current step.
+Each grid override has base_id, source, min, max, step. Return an empty
+array if retaining all base grids. Check the five stories as a family.
+
+{{template_json}}

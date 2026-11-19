@@ -102,7 +102,8 @@ def build_requests(
             ],
             "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
             "reasoning": {"effort": "low"},
-            "max_output_tokens": 2048 if stage == "assess" else 4096,
+            "max_output_tokens": getattr(args, "max_output_tokens", None)
+            or (2048 if stage == "assess" else 4096),
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -139,6 +140,13 @@ def decode_response(body: Record) -> Record:
     return json.loads(content)
 
 
+def credit_balance_exhausted(error: APIStatusError) -> bool:
+    return error.status_code == 429 and (
+        error.code in {"insufficient_quota", "credit_balance_exhausted"}
+        or error.type == "insufficient_quota"
+    )
+
+
 def fetch_flex(client: OpenAI, request: Record) -> Record:
     for attempt in range(6):
         try:
@@ -151,7 +159,7 @@ def fetch_flex(client: OpenAI, request: Record) -> Record:
         except (APIStatusError, APIConnectionError) as error:
             if isinstance(error, APIStatusError) and (
                 error.status_code not in {429, 500, 502, 503, 504}
-                or error.code == "insufficient_quota"
+                or credit_balance_exhausted(error)
             ):
                 raise
             if attempt == 5:
@@ -255,6 +263,19 @@ def run_requests(
                         try:
                             record(futures[future], future.result())
                         except (APIConnectionError, APIStatusError) as error:
+                            if isinstance(
+                                error, APIStatusError
+                            ) and credit_balance_exhausted(error):
+                                pool.shutdown(wait=True, cancel_futures=True)
+                                # Preserve successes that were in flight when quota ran out.
+                                for finished, key in futures.items():
+                                    if (
+                                        key not in saved
+                                        and not finished.cancelled()
+                                        and finished.exception() is None
+                                    ):
+                                        record(key, finished.result())
+                                raise
                             logger.warning(
                                 "%s: %s failed with %s",
                                 stage,

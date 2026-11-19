@@ -1,0 +1,61 @@
+Review the text-slot expansion of each runnable GSM8K template. Compare the
+question, its original answer logic, and the revised role names and options.
+You are reviewing prose and meaning across combinations of slots. The caller
+already verified the exact numeric graph, answer step, numeric grids,
+constraints, and the number of independently varying rendered slots.
+
+## What qualifies
+
+Accept an edit if at least two slots vary recognizable details within the same
+story and the actual question still determines the inherited calculation.
+The full name of an existing participant is one valid slot. Two distinct
+existing people can supply two slots. Names of establishments, colors of
+existing objects, item types, test subjects, or locations relevant to the
+existing action can be valid independent slots. A detail need not change the
+calculation. Spelling, casing, articles, pronouns for the same person, and
+unrelated scene-setting do not qualify. If an inherited pool has mostly
+near-synonymous options, count the varying roles actually available in the
+revised template.
+
+Keep the mathematical and narrative roles fixed. When a proposed name
+replaces “her sister,” the question still needs to identify her sister.
+Naming an existing school, store, or participant is a text change. Replacing
+an individual event with a team competition can change its premise.
+Different product choices are compatible when the question explicitly states
+the unit and rate for each. “Six crackers” and “six pieces of one cracker”
+count different units. A location must support the events that follow it.
+
+## What to check
+
+Read the question as a solver. Look for missing givens, unclear inclusions or
+allocation rules, conflicting roles, wrong comparison bases or denominators,
+and changes in the requested target. For example, a savings loss can occur
+once or recur each time a threshold is reached. Report an ambiguity if a
+different plausible reading produces a different result. Accept a
+clarification if it states the premise already required by the inherited
+calculation.
+
+Check the question and worked solution text against each relevant option:
+articles, noun and verb agreement at one, pronouns, named roles, and the
+selected entity across later references. “Each pretzel crackers” and
+“a online retailer” are grammar defects. An old name in an internal slot ID
+is invisible. Check actual choice pools before asserting a collision.
+A name can belong to someone with any stated pronoun. Singular they is valid.
+A generic reference such as “the second group” may still correctly identify
+the entity. Judge concrete defects rather than stylistic preferences.
+
+The supplied legal renders are evidence. Do not combine arbitrary numeric
+range endpoints and assume they satisfy the constraints. Large or unusual
+values alone do not show an error. An independently recomputed answer
+disagreement is useful only with a specific reading or derivation supported
+by the question. If a defect is unchanged from the base, label it inherited.
+
+## Decisions
+
+Return one entry per source ID. Choose pass when the expanded question and
+solution meet the criteria. On pass, use origin none. Choose revise for a
+real defect and label its origin introduced, inherited, or uncertain.
+Give one short reason quoting the problematic phrase or identifying the
+specific unsupported assumption. Do not omit a record.
+
+{{items_json}}

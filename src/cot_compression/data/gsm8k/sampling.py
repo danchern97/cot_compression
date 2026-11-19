@@ -2,7 +2,7 @@
 
 import random
 from fractions import Fraction
-from itertools import product
+from itertools import chain, product
 
 from cot_compression.data.gsm8k.io import Record
 from cot_compression.data.gsm8k.templates import evaluate, number_text, render
@@ -25,14 +25,14 @@ def numeric_cases(t: Record) -> list[dict[str, Fraction]]:
         if end != original
     ]
     rng = random.Random(42)
-    edges.extend(
+    random_draws = (
         {
             n["id"]: low + step * rng.randrange(1 + (high - low) // step)
             for n, (_, low, high, step) in zip(slots, grids, strict=True)
         }
         for _ in range(512)
     )
-    for givens in edges:
+    for givens in chain(edges, random_draws):
         try:
             boundary = evaluate(t, givens)
         except (ValueError, ZeroDivisionError):

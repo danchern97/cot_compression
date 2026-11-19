@@ -1,0 +1,101 @@
+Add useful non-numeric variation to one runnable GSM8K template. Keep the same
+story, events, quantitative roles, answer, and ordered calculation. The caller
+preserves the numeric slots, grids, constraints, operators, operands, and step
+IDs. Your patch changes text and choice pools.
+
+## Pick the smallest safe expansion
+
+1. Start with the existing slots. Preserve all IDs and all existing values in
+   their original order. A slot counts as varying only when it has distinct
+   usable choices. If a fixed slot already names a suitable detail, add
+   compatible alternatives there first.
+2. Otherwise, replace a literal detail already involved in the story with a
+   new slot. Prefer naming a distinct participant already in the task over
+   changing the kind of event. Otherwise choose an item, category, activity,
+   or setting that fits all later events. Use the existing literal as the
+   first value when practical. Add at least two distinct alternatives when
+   they fit. Every new ID and its placeholder must use ASCII lowercase
+   letters, digits, and underscores, starting with a letter. A label can
+   use accented text in its values. Use {pinata_type}, not {piñata_type}.
+3. Require at least two independently varying roles and five distinct rendered
+   questions at every legal numeric setting. Once two roles work, actively
+   look for a third already present, such as a separately counted product
+   or a second named character. Add it when its alternatives are compatible.
+   Keep two if the third would be filler or alter a premise. Full names for different
+   existing characters count as distinct roles. A name split into parts,
+   articles, pronouns, spellings, or a new incidental detail do not count.
+
+Use pools with different meanings, not near-synonyms. Distinct characters,
+colors, or categories must remain distinct for all combinations. A text option
+cannot imply a new size, conversion, quantity, participant count, or rate.
+Leave such a detail fixed and vary another role. Return a hold if the second
+meaningful slot would require inventing an unrelated detail.
+
+## Construct a safe sentence around the slot
+
+- Give a slot one grammatical job. If possible, keep a stable head noun and
+  vary a type, flavor, or label. For instance, “{tea_type} tea” can use
+  green, black, and mint. When a whole noun phrase must vary, use wording
+  common to all options. Write “the {retailer}” where reference is clear, or
+  include the appropriate article in every value if the template has none.
+- Keep number agreement in both the question and the solution. A plural
+  pool such as “wheat crackers / rice crackers” fits “{count} {snack}” only
+  when the count cannot be one. It never fits “Each {snack} has.” Write
+  “Each piece in the second group has” in the solution, or use singular
+  labels within a count-neutral phrase. A varying modifier should never
+  leave “1 items” or “Each plural noun” in a render. The renderer supports
+  `{count} item(s)` only for a simple regular noun directly after the number.
+- Follow the role through the entire question and any solution lines that
+  name it. Reuse its slot or use a stable referent such as “each item in the
+  first group,” “the other person,” or “that amount.” Avoid leaving a
+  hardcoded entity from the original where a new choice could contradict it.
+  Retain relationship words and roles when giving someone a variable name.
+  For example, use “her sister {sister}” where the original says “her sister.”
+  Subtypes must fit any unchanged equipment, setting, and assumptions.
+  A location must make later actions sensible for every value.
+
+## Review the candidate as a small diff
+
+Check that the question gives every original numeric placeholder with the
+same format, including percent, and the same meaning. Keep numerical facts
+such as rates and group sizes tied to the same named roles. When the base has
+two groups, give both original counts. For each edited explanation, retain
+the same calculation, units, and answer. Keep the template's target and its
+timing, grouping, and allocation rules. If an ambiguity would change the
+solution, clarify only the reading supported by the original graph. A reset that the graph applies
+once should be described as one event if the original wording could imply
+that it repeats.
+
+Read the complete question and affected solution once with the first value
+from every pool and again with the last value from every pool. Check any
+option with an article or unusual plural separately. Consider a legal count
+of one where permitted. Reject any proposed option that breaks either the
+question or an explanation.
+
+## Examples
+
+- A baker slot already varies. “Blueberry muffins” in a batch recipe becomes
+  “{flavor} muffins,” with blueberry, lemon, or banana. It keeps the baked
+  item and its explicitly given batch rate. A bakery-name slot would add
+  little if the story has no bakery.
+- A class problem has one named teacher and one fixed student name. Extend the
+  existing student pool first if it already exists. If it is literal, add a
+  student slot and refer to that student consistently. Keep teacher and
+  student names disjoint. Preserve which person gives or receives each group.
+- With “{a_count} oat cookies” and “{b_count} oat biscuits,” two new label
+  pools cannot replace either numeric count. A safe solution says “Each
+  biscuit from the second group has …” and multiplies by {b_count}. It
+  cannot say “Each oat biscuits has …” or omit the second count.
+- If the edit just adds options to an existing pool, return `question: null`
+  and `explanation_updates: []`. The base wording is copied verbatim.
+
+## Output
+
+Return a JSON object with the input `source_id`, a `status` of `expanded`
+or `hold`, and a short `reason`. Supply the complete `choices` list.
+Supply the full `question` if its text changed, or null otherwise. Supply
+only changed `explanation_updates`, each with its original step ID. On hold,
+return original choices, a null question, and no explanation updates.
+If the input includes feedback, use it to revise the earlier patch.
+
+{{template_json}}

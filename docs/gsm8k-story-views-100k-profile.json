@@ -1,0 +1,107 @@
+{
+  "base_templates": 2000,
+  "story_templates": 10000,
+  "catalog_records": 12000,
+  "views": 100000,
+  "views_per_base": 50,
+  "eligible_complete_families": 2192,
+  "excluded_base_review_ids": [
+    "gsm8k/train/4566",
+    "gsm8k/train/66"
+  ],
+  "selection_seed": 42,
+  "selection_method": "Retain the prior stratified sample where five shared numeric setups are possible. Replace remaining families with verified reserves nearest in step count.",
+  "solution_step_distribution": {
+    "1": 12,
+    "2": 514,
+    "3": 524,
+    "4": 394,
+    "5": 232,
+    "6": 154,
+    "7": 87,
+    "8": 42,
+    "9": 24,
+    "10": 9,
+    "11": 5,
+    "12": 3
+  },
+  "stories_with_adapted_numeric_grids": 3065,
+  "ids": {
+    "base_id": "Original GSM8K source ID shared by the family.",
+    "template_id": "{base_id}/v0 for the original, {base_id}/v1 through v5 for the stories.",
+    "view_id": "{template_id}/t{text_setting}/n{numeric_setting}",
+    "solution_step_ids": "Ordered canonical calculation IDs. Combine with base_id to align steps across stories.",
+    "numeric_inputs": "Exact values keyed by the original template's numeric slot IDs. Join through numeric_map to obtain the story's IDs.",
+    "text_inputs": "Values keyed by the story's text slot IDs.",
+    "numeric_group_id": "{base_id}/n{numeric_setting}"
+  },
+  "checks": {
+    "replayed_story_graphs": 10000,
+    "replayed_question_and_solution_pairs": 100000,
+    "normalized_duplicate_questions": 0,
+    "text_settings_with_two_distinct_answers": 50000
+  },
+  "input_sha256": {
+    "data/gsm8k-luna-6000-expanded-text-slots/templates.jsonl": "751ce0a11ed4f6c0ecf60ac9711d0c28e2bd2250cdfcc77b1e4a046b21c6451d",
+    "data/gsm8k-luna-6000-expanded-text-slots/text-slot-review.jsonl": "03859dcc4d1918fac8a49879832ec5aa7158e550f2d1e23001df7b42c73a2a47",
+    "data/gsm8k-luna-6000-five-stories-partial/templates.jsonl": "6accf32ee9beddcc3ee9d34b4e6eba76b1453e17d00fc265b3bc508eaafaac17",
+    "data/gsm8k-luna-6000-five-stories-partial/views.jsonl": "e6e960d2c19ca866304ce271ef8f8b73b97af2ac5db24af7917f6bebe1d5d91d"
+  },
+  "files_sha256": {
+    "views.jsonl": "3c77c6b6c6365a61d0fc64c8e8d918c80022106029bb9b9ef0deb695bf86ee6d",
+    "templates.jsonl": "20ab90acf8c4a52ee559c1ac830db3062227263017666361c6e97ad0fe1e3196"
+  },
+  "numeric_sampling": {
+    "seed": 20261119,
+    "cycle": [
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        3,
+        4
+      ],
+      [
+        4,
+        5
+      ],
+      [
+        5,
+        1
+      ]
+    ],
+    "numeric_groups": 10000,
+    "numeric_setups_per_base": 5,
+    "numeric_setups_per_story": 5,
+    "replaced_families": {
+      "gsm8k/train/1816": "gsm8k/train/6492",
+      "gsm8k/train/1737": "gsm8k/train/1184",
+      "gsm8k/train/2867": "gsm8k/train/5671",
+      "gsm8k/train/4029": "gsm8k/train/2773",
+      "gsm8k/train/4973": "gsm8k/train/3473",
+      "gsm8k/train/3038": "gsm8k/train/3828",
+      "gsm8k/train/5849": "gsm8k/train/4926",
+      "gsm8k/train/5684": "gsm8k/train/4145",
+      "gsm8k/train/6708": "gsm8k/train/1773",
+      "gsm8k/train/3838": "gsm8k/train/6906",
+      "gsm8k/train/673": "gsm8k/train/2562",
+      "gsm8k/train/6756": "gsm8k/train/4219",
+      "gsm8k/train/3022": "gsm8k/train/4867",
+      "gsm8k/train/5114": "gsm8k/train/7351",
+      "gsm8k/train/4899": "gsm8k/train/7031",
+      "gsm8k/train/2726": "gsm8k/train/2928",
+      "gsm8k/train/607": "gsm8k/train/3321",
+      "gsm8k/train/7332": "gsm8k/train/5437",
+      "gsm8k/train/5693": "gsm8k/train/3871",
+      "gsm8k/train/4593": "gsm8k/train/5564",
+      "gsm8k/train/211": "gsm8k/train/840",
+      "gsm8k/train/1858": "gsm8k/train/5792"
+    }
+  },
+  "resampled_from": "data/gsm8k-luna-100k-views-per-text"
+}

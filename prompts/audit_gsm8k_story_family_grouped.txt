@@ -1,0 +1,38 @@
+Audit each supplied family of GSM8K story variants independently. The
+execution engine has already checked its original computation graph,
+bindings, solution order, and number of text renderings. Compare the supplied
+base and proposed stories within that family.
+
+Review each candidate's premise against the base, the other candidates, and
+any previously accepted siblings. A new activity, goal, or distinct role for
+the quantities qualifies. Renaming people, products, or venues in the same
+event does not. Similar arithmetic is required and does not signal duplication.
+When two candidates present the same situation, keep the clearer one and flag
+the other. Do not flag an accepted sibling. Distinguish using batteries to
+power devices from estimating travel times, even if both multiply a rate by
+a duration. Treat repairing two groups of furniture and repairing two groups
+of stage props as the same activity if the roles and goal also match.
+
+Check that, in every supplied render, the question alone leads to the given
+answer. Confirm the quantitative relations and units, the sets being counted,
+and any required allocation, rate, or timing assumptions. Check whether a
+fractional result suits the story and whether a range probe is plausible.
+Evaluate the supplied legal draws. Avoid criticisms based on hypothetical
+settings that might violate constraints. If a setting permits only integer
+counts, check shown results for fractional items. An unusual but possible
+stated given is acceptable.
+
+Read the question, answer, and choice pools together. Confirm that the text
+roles independently change meaningful details. Check articles, noun agreement
+at one, references to fixed names or objects in the solution, and pool
+collisions. Check middle options as well as the displayed examples. Give
+concrete evidence for any flagged item. Accept when the story is distinct and
+no concrete wording or math inconsistency can be identified. A stylistic
+preference alone is compatible with acceptance.
+
+Return a decisions array, one object per family in input order. Include the
+family's source_id and a variants array with exactly one decision for each
+candidate ID, in order. Use accept, too_close, wording, or math. Give one
+concise reason naming the actual issue or stating why the story qualifies.
+
+{{template_json}}

@@ -18,9 +18,12 @@ versions at two legal numeric settings with different answers. Four templates
 are flagged for math review. The snapshot and profile are in
 `data/gsm8k-luna-6000-pre-story-variation/`.
 
-**Planned story variation.** Generate five distinct stories per template with the same
-calculation graph. Five stories × two numeric settings × five text versions
-gives **50 views per template**.
+**GSM8K Story Views 100K** contains 100,000 rendered problems from 2,000 base
+templates and 10,000 story variants. Each base has five numeric setups shared
+across its five stories. Each story has five text settings with two numeric
+instances each, so every numeric setup has ten matching views.
+[Hugging Face dataset](https://huggingface.co/datasets/danchern/gsm8k-story-views-100k) ·
+[Generation and validation record](docs/gsm8k-story-views-100k.md)
 
 ## Models and cost
 
@@ -28,7 +31,7 @@ The OpenAI Responses API uses **GPT-6 Luna on Flex** with prompt caching and
 **GPT-6.2 Sol on Batch** for targeted arithmetic repairs. The base dataset cost
 about **$4.22** through wording review, estimated from recorded token usage.
 
-## Reproduce
+## Reproduce base template extraction
 
 Install the locked dependencies and download the original GSM8K training file.
 
